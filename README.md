@@ -5,8 +5,10 @@ on Hackintosh. The card works like a Mac's AirPort card: it shows up in the
 Wi-Fi menu, auto-joins and reconnects after sleep. SIP stays enabled, and no
 client app is needed.
 
-> [!WARNING]
-> Kernel extension in active development. Keep a bootable EFI backup on USB.
+> [!IMPORTANT]
+> **Discontinued.** Development stopped with version 1.0.0. The driver stays
+> usable as is, but the [remaining issues](#remaining-issues) will not be
+> fixed. Keep a bootable EFI backup on USB.
 
 <p align="center">
   <img src="docs/images/speedtest-2.0.1.png" alt="RTL8821CE speed test: 93.40 Mbps down, 92.45 Mbps up" width="380">
@@ -50,15 +52,35 @@ It ends with a report block (without MAC, IP or network name) for a
 networks, 2.4 and 5 GHz (80 MHz), Wi-Fi menu and auto-join, network switching,
 group rekeys, sleep/wake.
 
-**Doesn't work yet:** WPA3-only, Enterprise, hidden networks, AirDrop and
+**Doesn't work:** WPA3-only, Enterprise, hidden networks, AirDrop and
 Continuity (AWDL). Bluetooth is a separate device and is not covered. TKIP is
 untested.
 
-**Known issues:**
-- Heavy parallel uploads can overflow macOS's output queue (1–4% drops in
-  `networkQuality`). Speed stays at line rate.
-- After some wakes, macOS may label the network as "hidden". The connection
-  is not affected.
+## Remaining issues
+
+These are known and will not be fixed:
+
+- **Upload drops.** Heavy parallel uploads overflow macOS's 256-packet Wi-Fi
+  output queue (about 1–4% drops in `networkQuality`, much more in some
+  multi-stream tests). The number varies widely between runs. Speed stays at
+  line rate.
+- **Small UDP loss.** Packet-loss tests (for example speed.cloudflare.com)
+  show about 0.4% loss on Wi-Fi, in short bursts. The likely contributors are
+  AWDL off-channel windows and the upload drops above; this was not confirmed.
+- **AWDL.** The driver periodically leaves the router's channel for AWDL
+  (AirDrop/Continuity) advertising, which adds short latency spikes. No AWDL
+  peer has ever been seen, so AirDrop and Continuity do not work.
+- **Occasional slow transmit stalls.** Under load the card sometimes sends very
+  slowly for 10–50 ms. The cause is unknown.
+- **"Hidden" network label.** Fixed after wake; after switching networks,
+  macOS may still label the network as hidden. The connection is not
+  affected.
+- **Unsupported security and joins:** WPA3-only (SAE), Enterprise/802.1X,
+  OWE, PMF-required networks and joining hidden networks. TKIP is untested.
+- **Untested hardware and systems:** RTL8822BE/CE, macOS other than Sonoma
+  14.8.9, roaming, and long standby/hibernate.
+- The two output gates in the driver never engage on the IO80211 push data
+  path; the code is inert and kept as is.
 
 ## Setup (OpenCore)
 
@@ -101,11 +123,10 @@ Requires the Xcode Command Line Tools and `python3`. Load the kext through
 OpenCore, not `make install`. Host tests: [tests/README.md](tests/README.md).
 Changes: [CHANGELOG.md](CHANGELOG.md).
 
-## Contributing
+## Status
 
-The most useful contribution right now is a compatibility report, especially
-for RTL8822BE/CE, Sequoia/Tahoe and desktop cards. Pull requests are welcome
-for WPA3-only, Enterprise, hidden networks, AWDL and upload drops.
+Discontinued: no further development, fixes or releases are planned. The
+source is GPL-2.0, so anyone may fork it and continue.
 
 Tested on an HP 15-da0003tu (i3-8130U), OpenCore 1.0.7, macOS 14.8.9.
 

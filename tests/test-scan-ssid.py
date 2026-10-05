@@ -61,7 +61,7 @@ public:
 };
 '''
 main=r'''
-static const uint8_t B1[6]={0x08,0x8a,0xf1,0x79,0xc3,0x5a},B2[6]={0x08,0x8a,0xf1,0x79,0xc3,0x5b};
+static const uint8_t B1[6]={0x02,0x00,0x00,0x00,0x00,0x01},B2[6]={0x02,0x00,0x00,0x00,0x00,0x02};
 static const uint8_t RSN[]={48,20,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,2,0,0};
 typedef std::vector<uint8_t> V;
 static V ie(uint8_t id,const V&b){V v{id,(uint8_t)b.size()};v.insert(v.end(),b.begin(),b.end());return v;}
@@ -88,16 +88,16 @@ static int countSsid(const RTW88BSS*b){int c=0;for(uint32_t i=0;i+2<=b->ies_len;
 int main(){
  const uint16_t BEACON=0x80,PRESP=0x50;
  // 1. named beacon -> broadcast; beacon_named set
- {RTW88IEEE80211 c;c.processScanResult(mgmt(BEACON,B1,body(ssid("X1REN_5G"),true)));
-  auto*e=c.find(B1);assert(e&&e->beacon_named&&e->ssid_len==8&&corewlan(e,"X1REN_5G")==2&&e->cipher==WLAN_CIPHER_SUITE_CCMP);
+ {RTW88IEEE80211 c;c.processScanResult(mgmt(BEACON,B1,body(ssid("TestAP5G"),true)));
+  auto*e=c.find(B1);assert(e&&e->beacon_named&&e->ssid_len==8&&corewlan(e,"TestAP5G")==2&&e->cipher==WLAN_CIPHER_SUITE_CCMP);
  // 2. later all-zero-SSID beacon from the same BSSID -> name restored, still broadcast, one SSID element first
   int l0=logs;c.processScanResult(mgmt(BEACON,B1,body(ie(0,V(8,0)),true)));e=c.find(B1);
-  assert(e->ssid_len==8&&!memcmp(e->ssid,"X1REN_5G",8)&&corewlan(e,"X1REN_5G")==2&&countSsid(e)==1&&e->ies[0]==0&&e->ies[1]==8&&logs==l0+1);wellformed(e);
+  assert(e->ssid_len==8&&!memcmp(e->ssid,"TestAP5G",8)&&corewlan(e,"TestAP5G")==2&&countSsid(e)==1&&e->ies[0]==0&&e->ies[1]==8&&logs==l0+1);wellformed(e);
  // 3. empty SSID element and a frame with no SSID element at all -> restored too
-  c.processScanResult(mgmt(BEACON,B1,body(V{0,0},true)));e=c.find(B1);assert(corewlan(e,"X1REN_5G")==2&&countSsid(e)==1);wellformed(e);
-  {V nb=body(V(),true);c.processScanResult(mgmt(BEACON,B1,nb));e=c.find(B1);assert(corewlan(e,"X1REN_5G")==2&&countSsid(e)==1);wellformed(e);}
+  c.processScanResult(mgmt(BEACON,B1,body(V{0,0},true)));e=c.find(B1);assert(corewlan(e,"TestAP5G")==2&&countSsid(e)==1);wellformed(e);
+  {V nb=body(V(),true);c.processScanResult(mgmt(BEACON,B1,nb));e=c.find(B1);assert(corewlan(e,"TestAP5G")==2&&countSsid(e)==1);wellformed(e);}
  // 4. blank probe response after named beacon -> restored, flag kept
-  c.processScanResult(mgmt(PRESP,B1,body(ie(0,V(8,0)),false)));e=c.find(B1);assert(e->beacon_named&&e->ssid_len==8&&countSsid(e)==1&&e->ies[2]=='X');wellformed(e);
+  c.processScanResult(mgmt(PRESP,B1,body(ie(0,V(8,0)),false)));e=c.find(B1);assert(e->beacon_named&&e->ssid_len==8&&countSsid(e)==1&&e->ies[2]=='T');wellformed(e);
  // 5. named beacon again replaces cleanly; renamed AP takes the new name
   c.processScanResult(mgmt(BEACON,B1,body(ssid("RENAMED"),true)));e=c.find(B1);assert(e->ssid_len==7&&corewlan(e,"RENAMED")==2);
   c.processScanResult(mgmt(BEACON,B1,body(ie(0,V(7,0)),true)));e=c.find(B1);assert(corewlan(e,"RENAMED")==2);
@@ -105,17 +105,17 @@ int main(){
  // 6. truly hidden AP: beacons always blank; named probe response does not set beacon_named,
  //    so a later blank beacon is NOT rewritten (hidden behaviour unchanged)
  {RTW88IEEE80211 c;int l0=logs;c.processScanResult(mgmt(BEACON,B2,body(ie(0,V(10,0)),true,2)));auto*e=c.find(B2);
-  assert(e&&!e->beacon_named&&e->ssid_len==0&&corewlan(e,"PEACE HOME")==3);
-  c.processScanResult(mgmt(PRESP,B2,body(ssid("PEACE HOME"),false,2)));e=c.find(B2);assert(!e->beacon_named&&e->ssid_len==10);
+  assert(e&&!e->beacon_named&&e->ssid_len==0&&corewlan(e,"Guest Home")==3);
+  c.processScanResult(mgmt(PRESP,B2,body(ssid("Guest Home"),false,2)));e=c.find(B2);assert(!e->beacon_named&&e->ssid_len==10);
   c.processScanResult(mgmt(BEACON,B2,body(ie(0,V(10,0)),true,2)));e=c.find(B2);
-  assert(!e->beacon_named&&e->ssid_len==10&&corewlan(e,"PEACE HOME")==3&&logs==l0);}
+  assert(!e->beacon_named&&e->ssid_len==10&&corewlan(e,"Guest Home")==3&&logs==l0);}
  // 7. restore with a full 511-byte IE list: bounded, well formed, SSID first
  {RTW88IEEE80211 c;c.processScanResult(mgmt(BEACON,B1,body(ssid("ABCDEFGHIJKLMNOPQRSTUVWXYZ012345"),true)));
   V big=ie(0,V(32,0));V tim=ie(5,{0,1,0,0});big.insert(big.end(),tim.begin(),tim.end());
   while(big.size()<520){V v=ie(221,V(40,0x33));big.insert(big.end(),v.begin(),v.end());}
   c.processScanResult(mgmt(BEACON,B1,big));auto*e=c.find(B1);wellformed(e);assert(e->ssid_len==32&&e->ies[0]==0&&e->ies[1]==32&&e->ies[2]=='A');}
  // 8. malformed / truncated lists at every length, then fuzz; keep entries well formed
- {RTW88IEEE80211 c;V full=body(ie(0,V(8,0)),true);c.processScanResult(mgmt(BEACON,B1,body(ssid("X1REN_5G"),true)));
+ {RTW88IEEE80211 c;V full=body(ie(0,V(8,0)),true);c.processScanResult(mgmt(BEACON,B1,body(ssid("TestAP5G"),true)));
   for(size_t n=0;n<=full.size();n++){V p(full.begin(),full.begin()+n);c.processScanResult(mgmt(BEACON,B1,p));
    auto*e=c.find(B1);wellformed(e);assert(e->ssid_len==8&&countSsid(e)==1);}
   for(uint32_t n=0;n<36;n++){auto*b=new sk_buff;b->len=n;b->data=(uint8_t*)malloc(n?n:1);memset(b->data,0,n?n:1);c.processScanResult(b);}
@@ -127,23 +127,23 @@ int main(){
   assert(c._bssCount<=2);}
  // 9 (r10). probe response (no TIM) after a beacon keeps the beacon's TIM -> broadcast at once
  {RTW88IEEE80211 c;memcpy(c._targetBSS.bssid,B1,6);
-  c.processScanResult(mgmt(PRESP,B1,body(ssid("X1REN_5G"),false)));auto*e=c.find(B1);
-  assert(corewlan(e,"X1REN_5G")==1&&!c._curBssTim);            // probe-only: no TIM yet
-  c.processScanResult(mgmt(BEACON,B1,body(ssid("X1REN_5G"),true)));e=c.find(B1);
-  assert(corewlan(e,"X1REN_5G")==2&&c._curBssTim);
-  c.processScanResult(mgmt(PRESP,B1,body(ssid("X1REN_5G"),false)));e=c.find(B1);
-  assert(corewlan(e,"X1REN_5G")==2&&c._curBssTim);wellformed(e);
+  c.processScanResult(mgmt(PRESP,B1,body(ssid("TestAP5G"),false)));auto*e=c.find(B1);
+  assert(corewlan(e,"TestAP5G")==1&&!c._curBssTim);            // probe-only: no TIM yet
+  c.processScanResult(mgmt(BEACON,B1,body(ssid("TestAP5G"),true)));e=c.find(B1);
+  assert(corewlan(e,"TestAP5G")==2&&c._curBssTim);
+  c.processScanResult(mgmt(PRESP,B1,body(ssid("TestAP5G"),false)));e=c.find(B1);
+  assert(corewlan(e,"TestAP5G")==2&&c._curBssTim);wellformed(e);
   int tims=0;for(uint32_t i=0;i+2<=e->ies_len;i+=2u+e->ies[i+1])tims+=e->ies[i]==5;assert(tims==1);
  // 10 (r10). trailing padding (empty vendor + empty SSID elements) is not copied
-  V pad=body(ssid("X1REN_5G"),false);V tail{0xDD,0,0,0,0,0,0,0};pad.insert(pad.end(),tail.begin(),tail.end());
-  c.processScanResult(mgmt(PRESP,B1,pad));e=c.find(B1);wellformed(e);assert(countSsid(e)==1&&corewlan(e,"X1REN_5G")==2);
+  V pad=body(ssid("TestAP5G"),false);V tail{0xDD,0,0,0,0,0,0,0};pad.insert(pad.end(),tail.begin(),tail.end());
+  c.processScanResult(mgmt(PRESP,B1,pad));e=c.find(B1);wellformed(e);assert(countSsid(e)==1&&corewlan(e,"TestAP5G")==2);
   for(uint32_t i=0;i+2<=e->ies_len;i+=2u+e->ies[i+1])assert(!(e->ies[i]==221&&e->ies[i+1]<3));
  // 11 (r10). a non-target BSS does not touch _curBssTim
-  c._curBssTim=false;c.processScanResult(mgmt(BEACON,B2,body(ssid("PEACE HOME"),true,2)));assert(!c._curBssTim);}
+  c._curBssTim=false;c.processScanResult(mgmt(BEACON,B2,body(ssid("Guest Home"),true,2)));assert(!c._curBssTim);}
  // 12 (r10). truly hidden AP stays hidden even with the TIM carried into a named probe response
  {RTW88IEEE80211 c;c.processScanResult(mgmt(BEACON,B2,body(ie(0,V(10,0)),true,2)));
-  c.processScanResult(mgmt(PRESP,B2,body(ssid("PEACE HOME"),false,2)));auto*e=c.find(B2);assert(corewlan(e,"PEACE HOME")!=2);
-  c.processScanResult(mgmt(PRESP,B2,body(ie(0,V(10,0)),false,2)));e=c.find(B2);assert(corewlan(e,"PEACE HOME")!=2);}
+  c.processScanResult(mgmt(PRESP,B2,body(ssid("Guest Home"),false,2)));auto*e=c.find(B2);assert(corewlan(e,"Guest Home")!=2);
+  c.processScanResult(mgmt(PRESP,B2,body(ie(0,V(10,0)),false,2)));e=c.find(B2);assert(corewlan(e,"Guest Home")!=2);}
  assert(live==0);
  puts("PASS: r10 TIM carried into probe responses, padding not copied, _curBssTim tracking, hidden AP still hidden; named beacon broadcast, blank/empty/missing SSID restored after a named beacon (beacon and probe response), rename, truly hidden AP unchanged, 512-byte cap, truncation at every length, 20,000 fuzz frames, no leaks");
 }

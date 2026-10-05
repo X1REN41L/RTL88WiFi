@@ -1,5 +1,15 @@
 # Changelog
 
+## Discontinued — 2026-10-06
+
+Development has stopped. 1.0.0 is the final release; the kext in `Kexts/` is
+unchanged. The README lists the remaining issues, which will not be fixed.
+
+- Removed unused source files (Linux-only chip, transport and optional
+  feature code, unreachable compatibility headers, an unbuilt kext class).
+  The driver still builds to the same binary.
+- Test fixtures use generic network names and addresses.
+
 ## 1.0.0 — 2026-10-02
 
 First release under the RTL88WiFi name.
