@@ -15,13 +15,13 @@
 	<key>CFBundleDisplayName</key>
 	<string>RTL88WiFi for RTL88xx</string>
 	<key>CFBundleGetInfoString</key>
-	<string>RTL88WiFi 1.0.0 — independent RTL88xx PCIe Wi-Fi driver</string>
+	<string>RTL88WiFi 1.0.1 — independent RTL88xx PCIe Wi-Fi driver</string>
 	<key>CFBundlePackageType</key>
 	<string>KEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0.0</string>
+	<string>1.0.1</string>
 	<key>CFBundleVersion</key>
-	<string>1.0.0</string>
+	<string>1.0.1</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>

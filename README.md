@@ -6,9 +6,12 @@ Wi-Fi menu, auto-joins and reconnects after sleep. SIP stays enabled, and no
 client app is needed.
 
 > [!IMPORTANT]
-> **Discontinued.** Development stopped with version 1.0.0. The driver stays
-> usable as is, but the [remaining issues](#remaining-issues) will not be
-> fixed. Keep a bootable EFI backup on USB.
+> **Discontinued.** Development stopped after version 1.0.0. Version 1.0.1 is
+> a final maintenance release that only corrects what System Information
+> reports (transmit rate, noise, channel widths, supported channels); see
+> [CHANGELOG](CHANGELOG.md). The driver stays usable as is, but the
+> [remaining issues](#remaining-issues) will not be fixed. Keep a bootable EFI
+> backup on USB.
 
 <p align="center">
   <img src="docs/images/speedtest-2.0.1.png" alt="RTL8821CE speed test: 93.40 Mbps down, 92.45 Mbps up" width="380">
@@ -79,6 +82,9 @@ These are known and will not be fixed:
   OWE, PMF-required networks and joining hidden networks. TKIP is untested.
 - **Untested hardware and systems:** RTL8822BE/CE, macOS other than Sonoma
   14.8.9, roaming, and long standby/hibernate.
+- **System Information leftovers.** AirDrop and Auto Unlock are listed as
+  "Supported" but do not work. Card Type shows the card's PCI subsystem ID,
+  not its device ID. RTL8821CE reports no noise value.
 - The two output gates in the driver never engage on the IO80211 push data
   path; the code is inert and kept as is.
 

@@ -1,3 +1,4 @@
+/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * Master compatibility header for rtw88 macOS port.
  * Every driver .c file that includes linux/ or net/ headers ends up here

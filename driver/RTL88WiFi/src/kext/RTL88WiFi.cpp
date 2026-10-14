@@ -1,4 +1,4 @@
-/* Modified by X1REN41L on 2026-10-02 for RTL88WiFi 1.0.0; see the repository NOTICE.md. */
+/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * Native IO80211 controller for the RTL8822BE port.
  */
@@ -144,7 +144,7 @@ IOWorkLoop *RTL88WiFi::getWorkLoop() const
 
 bool RTL88WiFi::start(IOService *provider)
 {
-    setProperty("DriverBuild", "1.0.0-rtl88wifi-r11-20261002");
+    setProperty("DriverBuild", "1.0.1-rtl88wifi-r12-20261014");
     setProperty("STA_R10_TXQ_GATE", kOSBooleanTrue);
     setProperty("STA_R11_TXQ_STALL_GATE", kOSBooleanTrue);
     setProperty("STA_V19_DARWIN_ENOTSUP_FIX", kOSBooleanTrue);
@@ -294,7 +294,7 @@ bool RTL88WiFi::start(IOService *provider)
     setProperty("DiagnosticLogging", kOSBooleanTrue);
     setProperty("DiagnosticLogCapacity", (uint64_t)32767, 32);
     _diagnosticsTimer->setTimeoutMS(1000);
-    IOLog("RTL88WiFi: 1.0.0 diagnostics enabled; skb cb=80; fixes=memory,wpa,gtk,peer,station,firmware,scan-ies,ap-ie-list,link-reason,rx-filter\n");
+    IOLog("RTL88WiFi: 1.0.1 diagnostics enabled; skb cb=80; fixes=memory,wpa,gtk,peer,station,firmware,scan-ies,ap-ie-list,link-reason,rx-filter\n");
     IOLog("RTL88WiFi: device started successfully\n");
     return true;
 }
@@ -2123,7 +2123,7 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         if (request_number == APPLE80211_IOC_DRIVER_VERSION) {
             char label[sizeof(d->string)] = {};
             strlcpy(label, chip, sizeof(label));
-            strlcat(label, " (RTL88WiFi 1.0.0)", sizeof(label));
+            strlcat(label, " (RTL88WiFi 1.0.1)", sizeof(label));
             d->string_len = (uint16_t)strlcpy(d->string, label, sizeof(d->string));
         } else {
             d->string_len = (uint16_t)strlcpy(d->string, chip, sizeof(d->string));
