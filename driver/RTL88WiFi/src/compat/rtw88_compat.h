@@ -161,6 +161,19 @@ void rtw88_get_stats(struct rtw_dev *rtwdev, uint32_t *tx_bytes, uint32_t *rx_by
  * need the Linux driver's private layout live in rtw88_compat.c, after main.h
  * has provided the complete definition. */
 uint8_t rtw88_get_tx_nss(struct rtw_dev *rtwdev);
+/* Current TX rate of the associated station, from the latest firmware RA
+ * report (fw.c rtw_fw_ra_report_iter).  Returns false until a report has
+ * arrived; callers must then report the rate as unknown. */
+struct rtw88_tx_rate {
+    uint32_t kbps;    /* PHY rate, kbit/s */
+    uint8_t  ht;      /* HT MCS: mcs is 0-31 */
+    uint8_t  vht;     /* VHT MCS: mcs is 0-9 */
+    uint8_t  mcs;
+    uint8_t  nss;     /* spatial streams (1 for legacy rates) */
+    uint8_t  bw_mhz;  /* 20/40/80 (20 for legacy rates) */
+    uint8_t  sgi;     /* short guard interval */
+};
+bool rtw88_get_tx_rate(struct rtw88_tx_rate *out);
 uint32_t rtw88_read_log(char *out_buf, uint32_t max_len);
 void rtw88_candidate_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint32_t rtw88_copy_log(char *out_buf, uint32_t max_len, uint64_t *total_bytes);

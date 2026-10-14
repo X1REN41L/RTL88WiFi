@@ -1591,6 +1591,62 @@ uint8_t rtw88_get_tx_nss(struct rtw_dev *rtwdev)
     return nss;
 }
 
+bool rtw88_get_tx_rate(struct rtw88_tx_rate *out)
+{
+    /* kbit/s for one spatial stream with 800 ns GI, MCS 0-9 (HT uses 0-7)
+     * at 20/40/80 MHz (IEEE 802.11-2016 tables 19-27..19-30, 21-30..21-37).
+     * The compat cfg80211_calculate_bitrate() is only an estimate, so
+     * ra_report.bit_rate is not used as a rate. */
+    static const uint32_t kbps_1ss[3][10] = {
+        {  6500, 13000, 19500,  26000,  39000,  52000,  58500,  65000,  78000,  86667 },
+        { 13500, 27000, 40500,  54000,  81000, 108000, 121500, 135000, 162000, 180000 },
+        { 29250, 58500, 87750, 117000, 175500, 234000, 263250, 292500, 351000, 390000 },
+    };
+    struct ieee80211_sta *sta = __atomic_load_n(&g_rtw88_sta, __ATOMIC_SEQ_CST);
+    struct rtw_ra_report rpt;
+    uint8_t bw_idx, mcs, nss;
+
+    if (!out) return false;
+    memset(out, 0, sizeof(*out));
+    if (!sta) return false;
+    rpt = ((struct rtw_sta_info *)sta->drv_priv)->ra_report;
+    /* The station is zero-allocated and every RA report sets a non-zero
+     * bit_rate, so zero means no report yet. */
+    if (rpt.bit_rate == 0) return false;
+
+    if (!(rpt.txrate.flags & (RATE_INFO_FLAGS_MCS | RATE_INFO_FLAGS_VHT_MCS))) {
+        if (rpt.txrate.legacy == 0) return false;
+        out->kbps = (uint32_t)rpt.txrate.legacy * 100U; /* 100 kbit/s units */
+        out->nss = 1;
+        out->bw_mhz = 20;
+        return true;
+    }
+
+    switch (rpt.txrate.bw) {
+    case RATE_INFO_BW_80: bw_idx = 2; out->bw_mhz = 80; break;
+    case RATE_INFO_BW_40: bw_idx = 1; out->bw_mhz = 40; break;
+    default:              bw_idx = 0; out->bw_mhz = 20; break;
+    }
+    if (rpt.txrate.flags & RATE_INFO_FLAGS_VHT_MCS) {
+        out->vht = 1;
+        mcs = rpt.txrate.mcs;
+        nss = rpt.txrate.nss;
+        out->mcs = mcs;
+    } else {
+        out->ht = 1;
+        out->mcs = rpt.txrate.mcs;          /* HT MCS 0-31 encodes NSS */
+        mcs = rpt.txrate.mcs % 8U;
+        nss = (uint8_t)(rpt.txrate.mcs / 8U + 1U);
+    }
+    if (mcs > 9 || nss == 0 || nss > 4) return false;
+    out->nss = nss;
+    out->sgi = (rpt.txrate.flags & RATE_INFO_FLAGS_SHORT_GI) ? 1 : 0;
+    out->kbps = kbps_1ss[bw_idx][mcs] * nss;
+    if (out->sgi)
+        out->kbps = out->kbps * 10U / 9U;   /* 3.6 us vs 4.0 us symbol */
+    return true;
+}
+
 uint32_t rtw88_read_log(char *out_buf, uint32_t max_len)
 {
     if (!out_buf || max_len == 0 || !rtw88_log_lock) return 0;

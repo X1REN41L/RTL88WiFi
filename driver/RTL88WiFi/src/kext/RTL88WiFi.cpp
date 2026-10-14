@@ -1913,13 +1913,18 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return kIOReturnError;
+        /* Live TX rate from the firmware RA report; unknown until the first
+         * report, and not applicable while the firmware sends HT/legacy. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx)) return kIOReturnNotReady;
+        if (!tx.vht) return kIOReturnUnsupported;
         auto *d = static_cast<RTW88MCSVHTData *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
-        d->index = 0; /* rtw88 port does not yet expose live TX MCS */
-        d->nss = _ieee80211->txNSS();
-        d->bw = _ieee80211->channelWidthMHz();
-        d->guard_interval = APPLE80211_GI_LONG;
+        d->index = tx.mcs;
+        d->nss = tx.nss;
+        d->bw = tx.bw_mhz;
+        d->guard_interval = tx.sgi ? APPLE80211_GI_SHORT : APPLE80211_GI_LONG;
         return kIOReturnSuccess;
     }
 
@@ -1939,10 +1944,14 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return 6;
+        /* HT MCS 0-31 or VHT MCS 0-9 of the live TX rate; legacy rates and
+         * a missing RA report have no MCS to report. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx) || !(tx.ht || tx.vht)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_mcs_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
-        d->index = 0; /* live TX-MCS export is not wired yet */
+        d->index = tx.mcs;
         return kIOReturnSuccess;
     }
 
@@ -2288,28 +2297,15 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestRATE(bool isSet, 
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return 6;
-        RTW88BSS b = {};
-        if (_ieee80211->copyCurrentBSS(&b) != kIOReturnSuccess) return 6;
+        /* Current TX PHY rate in Mbit/s from the firmware RA report (not the
+         * AP's advertised rates).  Unknown until the first report arrives. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_rate_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
         d->num_radios = 1;
-        uint32_t best = 0;
-        for (uint16_t pos = 0; pos + 2 <= b.ies_len;) {
-            const uint8_t id = b.ies[pos];
-            const uint8_t n = b.ies[pos + 1];
-            if ((uint32_t)pos + 2U + n > b.ies_len) break;
-            if (id == 1 || id == 50) {
-                for (uint8_t i = 0; i < n; ++i) {
-                    const uint32_t r = b.ies[pos + 2 + i] & 0x7fU;
-                    if (r > best) best = r;
-                }
-            }
-            pos = (uint16_t)(pos + 2U + n);
-        }
-        /* Legacy rates use 500-kbit/s units; the reference IO80211 driver exposes its
-         * net80211 rate value directly through this ABI. */
-        d->rate[0] = best;
+        d->rate[0] = tx.kbps / 1000U;
         return kIOReturnSuccess;
     }
 
