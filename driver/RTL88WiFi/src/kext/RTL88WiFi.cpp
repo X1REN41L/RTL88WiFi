@@ -61,6 +61,43 @@ static IOPMPowerState gRTW88PowerStates[kRTW88PowerStateCount] = {
       0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
+/* rtw88 does not measure a noise floor.  8822B/8822C report a per-path RX
+ * SNR in PHY status, so derive noise = RSSI - SNR from that measurement.
+ * With no SNR (8821C, or no samples yet) noise is reported as unavailable
+ * instead of being derived from a constant. */
+static bool rtw88LinkNoise(int rssi, int *noise, int *snr)
+{
+    int s = 0;
+    if (!rtw88_get_rx_snr(&s)) return false;
+    *snr = s;
+    *noise = rssi - s;
+    return true;
+}
+
+/* The port has no channel regulatory database: regulatory_hint() is a stub
+ * and rtw88's regd.c only maps a country code to a TX-power table, so
+ * copyChannels() returns every channel the chip supports.  Filter the
+ * 2.4 GHz edge channels reported to IO80211 by the active country code:
+ * channel 14 is legal only in JP, channels 12-13 are not legal in the US,
+ * CA and FCC territories.  Unknown or world codes (the default "ZZ",
+ * Apple's "X*" codes) keep the full list. */
+static bool rtw88ChannelAllowedInCountry(const uint8_t *cc, uint16_t ch)
+{
+    if (ch < 12 || ch > 14) return true;
+    char a = (char)cc[0], b = (char)cc[1];
+    if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+    if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z' || a == 'X' || (a == 'Z' && b == 'Z'))
+        return true;
+    if (ch == 14) return a == 'J' && b == 'P';
+    static const char fcc[][2] = {
+        {'U','S'}, {'C','A'}, {'P','R'}, {'G','U'}, {'A','S'}, {'V','I'}, {'M','P'}, {'U','M'}
+    };
+    for (const auto &c : fcc)
+        if (a == c[0] && b == c[1]) return false;
+    return true;
+}
+
 static const char *rtw88AirportChipName(const struct pci_dev *pdev)
 {
     if (!pdev) return "Realtek Wireless";
@@ -1913,13 +1950,18 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return kIOReturnError;
+        /* Live TX rate from the firmware RA report; unknown until the first
+         * report, and not applicable while the firmware sends HT/legacy. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx)) return kIOReturnNotReady;
+        if (!tx.vht) return kIOReturnUnsupported;
         auto *d = static_cast<RTW88MCSVHTData *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
-        d->index = 0; /* rtw88 port does not yet expose live TX MCS */
-        d->nss = _ieee80211->txNSS();
-        d->bw = _ieee80211->channelWidthMHz();
-        d->guard_interval = APPLE80211_GI_LONG;
+        d->index = tx.mcs;
+        d->nss = tx.nss;
+        d->bw = tx.bw_mhz;
+        d->guard_interval = tx.sgi ? APPLE80211_GI_SHORT : APPLE80211_GI_LONG;
         return kIOReturnSuccess;
     }
 
@@ -1939,10 +1981,14 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return 6;
+        /* HT MCS 0-31 or VHT MCS 0-9 of the live TX rate; legacy rates and
+         * a missing RA report have no MCS to report. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx) || !(tx.ht || tx.vht)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_mcs_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
-        d->index = 0; /* live TX-MCS export is not wired yet */
+        d->index = tx.mcs;
         return kIOReturnSuccess;
     }
 
@@ -1968,8 +2014,10 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
             d->reason = APPLE80211_LINK_DOWN_REASON_DEAUTH;
         } else {
             d->rssi = (uint32_t)st.rssi;
-            d->nf = (uint16_t)(int16_t)-95;
-            d->snr = (uint16_t)((st.rssi > -95) ? (st.rssi + 95) : 0);
+            int nf = 0, snr = 0;   /* 0 = unknown */
+            rtw88LinkNoise(st.rssi, &nf, &snr);
+            d->nf = (uint16_t)(int16_t)nf;
+            d->snr = (uint16_t)snr;
         }
         return kIOReturnSuccess;
     }
@@ -2151,13 +2199,15 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         IOReturn ret = _ieee80211->cmdGetState(&st);
         if (ret) return ret;
         if (st.state != RTW88_STATE_CONNECTED) return 6;
+        int nf = 0, snr = 0;
+        if (!rtw88LinkNoise(st.rssi, &nf, &snr)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_noise_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
         d->num_radios = 1;
         d->noise_unit = APPLE80211_UNIT_DBM;
-        d->noise[0] = d->aggregate_noise = -95;
-        d->noise_ext[0] = d->aggregate_noise_ext = -95;
+        d->noise[0] = d->aggregate_noise = nf;
+        d->noise_ext[0] = d->aggregate_noise_ext = nf;
         return kIOReturnSuccess;
     }
 
@@ -2288,28 +2338,15 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestRATE(bool isSet, 
         RTW88StateResult st = {};
         if (_ieee80211->cmdGetState(&st) != kIOReturnSuccess || st.state != RTW88_STATE_CONNECTED)
             return 6;
-        RTW88BSS b = {};
-        if (_ieee80211->copyCurrentBSS(&b) != kIOReturnSuccess) return 6;
+        /* Current TX PHY rate in Mbit/s from the firmware RA report (not the
+         * AP's advertised rates).  Unknown until the first report arrives. */
+        struct rtw88_tx_rate tx;
+        if (!rtw88_get_tx_rate(&tx)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_rate_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
         d->num_radios = 1;
-        uint32_t best = 0;
-        for (uint16_t pos = 0; pos + 2 <= b.ies_len;) {
-            const uint8_t id = b.ies[pos];
-            const uint8_t n = b.ies[pos + 1];
-            if ((uint32_t)pos + 2U + n > b.ies_len) break;
-            if (id == 1 || id == 50) {
-                for (uint8_t i = 0; i < n; ++i) {
-                    const uint32_t r = b.ies[pos + 2 + i] & 0x7fU;
-                    if (r > best) best = r;
-                }
-            }
-            pos = (uint16_t)(pos + 2U + n);
-        }
-        /* Legacy rates use 500-kbit/s units; the reference IO80211 driver exposes its
-         * net80211 rate value directly through this ABI. */
-        d->rate[0] = best;
+        d->rate[0] = tx.kbps / 1000U;
         return kIOReturnSuccess;
     }
 
@@ -2352,15 +2389,19 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestCHANNELS_INFO(boo
         IOReturn ret = _ieee80211->copyChannels(channels, APPLE80211_MAX_CHANNELS, &count);
         if (ret != kIOReturnSuccess && ret != kIOReturnNoSpace) return ret;
         if (count > APPLE80211_MAX_CHANNELS) count = APPLE80211_MAX_CHANNELS;
+        uint32_t n = 0;
         for (uint32_t i = 0; i < count; ++i) {
             const uint16_t ch = channels[i].number;
-            d->chan_num[i] = (uint8_t)ch;
-            d->passive[i] = channels[i].passive ? 1 : 0;
-            d->radar_dfs[i] = channels[i].radar ? 1 : 0;
-            d->support_40Mhz[i] = (ch != 14) ? 1 : 0;
-            d->support_80Mhz[i] = (ch > 14) ? 1 : 0;
-            d->chan_spec[i] = ch;
+            if (!rtw88ChannelAllowedInCountry(_countryCode, ch)) continue;
+            d->chan_num[n] = (uint8_t)ch;
+            d->passive[n] = channels[i].passive ? 1 : 0;
+            d->radar_dfs[n] = channels[i].radar ? 1 : 0;
+            d->support_40Mhz[n] = (ch != 14) ? 1 : 0;
+            d->support_80Mhz[n] = (ch > 14) ? 1 : 0;
+            d->chan_spec[n] = ch;
+            n++;
         }
+        count = n;
         d->num_chan_specs = (uint16_t)count;
         setProperty("STA_CHANNELS_INFO_OK", kOSBooleanTrue);
         setProperty("STA_CHANNELS_INFO_COUNT", (uint64_t)count, 32);
@@ -2375,14 +2416,18 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestHW_SUPPORTED_CHAN
         IOReturn ret = _ieee80211->copyChannels(channels, APPLE80211_MAX_CHANNELS, &count);
         if (ret) return ret;
         auto *d = static_cast<apple80211_sup_channel_data *>(data);
-        bzero(d, sizeof(*d)); d->version = APPLE80211_VERSION; d->num_channels = count;
+        bzero(d, sizeof(*d)); d->version = APPLE80211_VERSION;
+        uint32_t n = 0;
         for (uint32_t i = 0; i < count; i++) {
-            d->supported_channels[i].version = APPLE80211_VERSION;
-            d->supported_channels[i].channel = channels[i].number;
-            d->supported_channels[i].flags = APPLE80211_C_FLAG_ACTIVE |
+            if (!rtw88ChannelAllowedInCountry(_countryCode, channels[i].number)) continue;
+            d->supported_channels[n].version = APPLE80211_VERSION;
+            d->supported_channels[n].channel = channels[i].number;
+            d->supported_channels[n].flags = APPLE80211_C_FLAG_ACTIVE |
                 APPLE80211_C_FLAG_20MHZ |
                 (channels[i].number <= 14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
+            n++;
         }
+        d->num_channels = n;
         return kIOReturnSuccess;
     }
 
@@ -2846,9 +2891,11 @@ void RTL88WiFi::fillScanResultFromBSS(const RTW88BSS &b, struct apple80211_scan_
                            APPLE80211_C_FLAG_20MHZ |
         (b.channel <= 14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
 
-    d->asr_noise = -95;
+    /* No per-BSS noise/SNR measurement exists for scanned networks:
+     * report 0 (unknown).  CURRENT_NETWORK fills the measured link value. */
+    d->asr_noise = 0;
     d->asr_rssi = b.rssi;
-    d->asr_snr = (int16_t)(b.rssi - d->asr_noise);
+    d->asr_snr = 0;
     d->asr_beacon_int = (int16_t)b.beacon_interval;
     d->asr_cap = (int16_t)b.capabilities;
     d->asr_age = 0;
@@ -2974,6 +3021,17 @@ IOReturn RTL88WiFi::handleSCAN_RESULT(struct apple80211_scan_result **out)
      * (ni_rsnie_tlv holds every IE), so do the same on Sonoma and keep the
      * RSN-only Ventura contract unchanged. */
     fillScanResultFromBSS(b, &_scanResult, version_major >= 23);
+    /* Report the BSS's advertised operating width (HT/VHT Operation IEs),
+     * using the same parse as the connection chandef.  CURRENT_NETWORK keeps
+     * its conservative flags; the live width is in APPLE80211_IOC_CHANNEL. */
+    RTW88BssOperation op;
+    RTW88IEEE80211::parseBssOperation(b.ies, b.ies_len, &op);
+    uint32_t width = APPLE80211_C_FLAG_20MHZ;
+    if (b.channel > 14 && op.vhtWidth == 1 && op.vhtSeg0 != 0)
+        width = APPLE80211_C_FLAG_80MHZ;
+    else if (op.htStaWidth && (op.sco == 1 || op.sco == 3))
+        width = APPLE80211_C_FLAG_40MHZ | (op.sco == 1 ? APPLE80211_C_FLAG_EXT_ABV : 0);
+    _scanResult.asr_channel.flags = (_scanResult.asr_channel.flags & ~APPLE80211_C_FLAG_20MHZ) | width;
     _scanCursor++;
     setProperty("STA_V24_SCAN_RESULT_CURSOR", (uint64_t)_scanCursor, 32);
     setProperty("STA_V24_SCAN_RESULT_DURING_SCAN", _scanInProgress ? kOSBooleanTrue : kOSBooleanFalse);
@@ -3013,6 +3071,11 @@ IOReturn RTL88WiFi::handleCURRENT_NETWORK(struct apple80211_scan_result *out)
     }
 
     fillScanResultFromBSS(current, out, true);
+    int nf = 0, snr = 0;
+    if (rtw88LinkNoise(out->asr_rssi, &nf, &snr)) {
+        out->asr_noise = (int16_t)nf;
+        out->asr_snr = (int16_t)snr;
+    }
     kprintf("RTL88WiFi: CURRENT_NETWORK ssid_len=%u channel=%u rssi=%d ies=%d\n",
           out->asr_ssid_len, out->asr_channel.channel,
           out->asr_rssi, out->asr_ie_len);

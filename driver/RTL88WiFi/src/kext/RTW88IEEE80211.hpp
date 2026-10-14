@@ -136,6 +136,15 @@ struct RTW88BSS {
     RTW88BSS *next;
 };
 
+/* BSS operating width advertised by the HT Operation (61) and VHT
+ * Operation (192) IEs.  Shared by the connection chandef and scan results. */
+struct RTW88BssOperation {
+    int     sco;         /* HT secondary-channel offset: 1=above 3=below */
+    bool    htStaWidth;  /* HT "STA Channel Width" (40 MHz allowed)      */
+    int     vhtWidth;    /* VHT op channel width: >=1 means 80 MHz        */
+    uint8_t vhtSeg0;     /* VHT center-frequency segment 0 (center chan)  */
+};
+
 /* ------------------------------------------------------------------ */
 /*  Connection state                                                     */
 /* ------------------------------------------------------------------ */
@@ -219,6 +228,7 @@ public:
     IOReturn  cmdGetState(struct RTW88StateResult *result);
     uint8_t   txNSS() const;
     uint8_t channelWidthMHz() const { return _connChanWidth; }
+    static void parseBssOperation(const uint8_t *ies, uint16_t ielen, RTW88BssOperation *op);
     bool txAggregationActive() const { return _txBaActive; }
     uint32_t receivedFrameCount() const { return _rxFrameCount; }
     const char *scanEngine() const { return _scanEngine; }
