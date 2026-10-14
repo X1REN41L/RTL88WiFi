@@ -61,6 +61,19 @@ static IOPMPowerState gRTW88PowerStates[kRTW88PowerStateCount] = {
       0, 0, 0, 0, 0, 0, 0, 0 },
 };
 
+/* rtw88 does not measure a noise floor.  8822B/8822C report a per-path RX
+ * SNR in PHY status, so derive noise = RSSI - SNR from that measurement.
+ * With no SNR (8821C, or no samples yet) noise is reported as unavailable
+ * instead of being derived from a constant. */
+static bool rtw88LinkNoise(int rssi, int *noise, int *snr)
+{
+    int s = 0;
+    if (!rtw88_get_rx_snr(&s)) return false;
+    *snr = s;
+    *noise = rssi - s;
+    return true;
+}
+
 static const char *rtw88AirportChipName(const struct pci_dev *pdev)
 {
     if (!pdev) return "Realtek Wireless";
@@ -1977,8 +1990,10 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
             d->reason = APPLE80211_LINK_DOWN_REASON_DEAUTH;
         } else {
             d->rssi = (uint32_t)st.rssi;
-            d->nf = (uint16_t)(int16_t)-95;
-            d->snr = (uint16_t)((st.rssi > -95) ? (st.rssi + 95) : 0);
+            int nf = 0, snr = 0;   /* 0 = unknown */
+            rtw88LinkNoise(st.rssi, &nf, &snr);
+            d->nf = (uint16_t)(int16_t)nf;
+            d->snr = (uint16_t)snr;
         }
         return kIOReturnSuccess;
     }
@@ -2160,13 +2175,15 @@ __attribute__((__noinline__)) SInt32 RTL88WiFi::handleNativeRequest(
         IOReturn ret = _ieee80211->cmdGetState(&st);
         if (ret) return ret;
         if (st.state != RTW88_STATE_CONNECTED) return 6;
+        int nf = 0, snr = 0;
+        if (!rtw88LinkNoise(st.rssi, &nf, &snr)) return kIOReturnNotReady;
         auto *d = static_cast<apple80211_noise_data *>(data);
         bzero(d, sizeof(*d));
         d->version = APPLE80211_VERSION;
         d->num_radios = 1;
         d->noise_unit = APPLE80211_UNIT_DBM;
-        d->noise[0] = d->aggregate_noise = -95;
-        d->noise_ext[0] = d->aggregate_noise_ext = -95;
+        d->noise[0] = d->aggregate_noise = nf;
+        d->noise_ext[0] = d->aggregate_noise_ext = nf;
         return kIOReturnSuccess;
     }
 
@@ -2842,9 +2859,11 @@ void RTL88WiFi::fillScanResultFromBSS(const RTW88BSS &b, struct apple80211_scan_
                            APPLE80211_C_FLAG_20MHZ |
         (b.channel <= 14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
 
-    d->asr_noise = -95;
+    /* No per-BSS noise/SNR measurement exists for scanned networks:
+     * report 0 (unknown).  CURRENT_NETWORK fills the measured link value. */
+    d->asr_noise = 0;
     d->asr_rssi = b.rssi;
-    d->asr_snr = (int16_t)(b.rssi - d->asr_noise);
+    d->asr_snr = 0;
     d->asr_beacon_int = (int16_t)b.beacon_interval;
     d->asr_cap = (int16_t)b.capabilities;
     d->asr_age = 0;
@@ -3009,6 +3028,11 @@ IOReturn RTL88WiFi::handleCURRENT_NETWORK(struct apple80211_scan_result *out)
     }
 
     fillScanResultFromBSS(current, out, true);
+    int nf = 0, snr = 0;
+    if (rtw88LinkNoise(out->asr_rssi, &nf, &snr)) {
+        out->asr_noise = (int16_t)nf;
+        out->asr_snr = (int16_t)snr;
+    }
     kprintf("RTL88WiFi: CURRENT_NETWORK ssid_len=%u channel=%u rssi=%d ies=%d\n",
           out->asr_ssid_len, out->asr_channel.channel,
           out->asr_rssi, out->asr_ie_len);

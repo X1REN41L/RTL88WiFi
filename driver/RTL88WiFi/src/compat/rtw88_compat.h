@@ -174,6 +174,11 @@ struct rtw88_tx_rate {
     uint8_t  sgi;     /* short guard interval */
 };
 bool rtw88_get_tx_rate(struct rtw88_tx_rate *out);
+/* Averaged RX SNR (dB) of frames from the associated BSS, from the per-path
+ * PHY-status SNR rtw88 parses on 8822B/8822C (dm_info.ewma_snr).  rtw88 has
+ * no noise-floor measurement, and 8821C reports no SNR.  Returns false when
+ * no SNR is available. */
+bool rtw88_get_rx_snr(int *snr_db);
 uint32_t rtw88_read_log(char *out_buf, uint32_t max_len);
 void rtw88_candidate_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 uint32_t rtw88_copy_log(char *out_buf, uint32_t max_len, uint64_t *total_bytes);

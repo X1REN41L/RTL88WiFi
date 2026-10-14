@@ -1647,6 +1647,38 @@ bool rtw88_get_tx_rate(struct rtw88_tx_rate *out)
     return true;
 }
 
+bool rtw88_get_rx_snr(int *snr_db)
+{
+    /* rx.c feeds ewma_snr only for frames of our BSS (beacons and frames to
+     * us), bucketed by rate class.  Prefer OFDM (5 GHz beacons), then the
+     * HT/VHT NSS classes, and average the receive paths with samples. */
+    static const u8 base[] = {
+        RTW_SNR_OFDM_A, RTW_SNR_1SS_A, RTW_SNR_2SS_A, RTW_SNR_3SS_A
+    };
+    struct ieee80211_hw *hw = g_rtw88_hw;
+    struct rtw_dev *rtwdev;
+    u8 paths;
+
+    if (!snr_db || !hw || !hw->priv) return false;
+    rtwdev = hw->priv;
+    paths = rtwdev->hal.rf_path_num;
+    if (paths == 0 || paths > 4) paths = 1;
+    for (unsigned int b = 0; b < ARRAY_SIZE(base); b++) {
+        unsigned long sum = 0, n = 0;
+        for (u8 path = 0; path < paths; path++) {
+            unsigned long v = ewma_snr_read(&rtwdev->dm_info.ewma_snr[base[b] + path]);
+            /* 0 = never sampled (8821C never samples); > 100 would be a
+             * negative s8 SNR fed through the unsigned EWMA. */
+            if (v > 0 && v <= 100) { sum += v; n++; }
+        }
+        if (n) {
+            *snr_db = (int)(sum / n);
+            return true;
+        }
+    }
+    return false;
+}
+
 uint32_t rtw88_read_log(char *out_buf, uint32_t max_len)
 {
     if (!out_buf || max_len == 0 || !rtw88_log_lock) return 0;
