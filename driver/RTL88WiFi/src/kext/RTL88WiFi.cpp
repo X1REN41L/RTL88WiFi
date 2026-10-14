@@ -74,6 +74,30 @@ static bool rtw88LinkNoise(int rssi, int *noise, int *snr)
     return true;
 }
 
+/* The port has no channel regulatory database: regulatory_hint() is a stub
+ * and rtw88's regd.c only maps a country code to a TX-power table, so
+ * copyChannels() returns every channel the chip supports.  Filter the
+ * 2.4 GHz edge channels reported to IO80211 by the active country code:
+ * channel 14 is legal only in JP, channels 12-13 are not legal in the US,
+ * CA and FCC territories.  Unknown or world codes (the default "ZZ",
+ * Apple's "X*" codes) keep the full list. */
+static bool rtw88ChannelAllowedInCountry(const uint8_t *cc, uint16_t ch)
+{
+    if (ch < 12 || ch > 14) return true;
+    char a = (char)cc[0], b = (char)cc[1];
+    if (a >= 'a' && a <= 'z') a = (char)(a - 'a' + 'A');
+    if (b >= 'a' && b <= 'z') b = (char)(b - 'a' + 'A');
+    if (a < 'A' || a > 'Z' || b < 'A' || b > 'Z' || a == 'X' || (a == 'Z' && b == 'Z'))
+        return true;
+    if (ch == 14) return a == 'J' && b == 'P';
+    static const char fcc[][2] = {
+        {'U','S'}, {'C','A'}, {'P','R'}, {'G','U'}, {'A','S'}, {'V','I'}, {'M','P'}, {'U','M'}
+    };
+    for (const auto &c : fcc)
+        if (a == c[0] && b == c[1]) return false;
+    return true;
+}
+
 static const char *rtw88AirportChipName(const struct pci_dev *pdev)
 {
     if (!pdev) return "Realtek Wireless";
@@ -2365,15 +2389,19 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestCHANNELS_INFO(boo
         IOReturn ret = _ieee80211->copyChannels(channels, APPLE80211_MAX_CHANNELS, &count);
         if (ret != kIOReturnSuccess && ret != kIOReturnNoSpace) return ret;
         if (count > APPLE80211_MAX_CHANNELS) count = APPLE80211_MAX_CHANNELS;
+        uint32_t n = 0;
         for (uint32_t i = 0; i < count; ++i) {
             const uint16_t ch = channels[i].number;
-            d->chan_num[i] = (uint8_t)ch;
-            d->passive[i] = channels[i].passive ? 1 : 0;
-            d->radar_dfs[i] = channels[i].radar ? 1 : 0;
-            d->support_40Mhz[i] = (ch != 14) ? 1 : 0;
-            d->support_80Mhz[i] = (ch > 14) ? 1 : 0;
-            d->chan_spec[i] = ch;
+            if (!rtw88ChannelAllowedInCountry(_countryCode, ch)) continue;
+            d->chan_num[n] = (uint8_t)ch;
+            d->passive[n] = channels[i].passive ? 1 : 0;
+            d->radar_dfs[n] = channels[i].radar ? 1 : 0;
+            d->support_40Mhz[n] = (ch != 14) ? 1 : 0;
+            d->support_80Mhz[n] = (ch > 14) ? 1 : 0;
+            d->chan_spec[n] = ch;
+            n++;
         }
+        count = n;
         d->num_chan_specs = (uint16_t)count;
         setProperty("STA_CHANNELS_INFO_OK", kOSBooleanTrue);
         setProperty("STA_CHANNELS_INFO_COUNT", (uint64_t)count, 32);
@@ -2388,14 +2416,18 @@ __attribute__((__noinline__)) IOReturn RTL88WiFi::handleRequestHW_SUPPORTED_CHAN
         IOReturn ret = _ieee80211->copyChannels(channels, APPLE80211_MAX_CHANNELS, &count);
         if (ret) return ret;
         auto *d = static_cast<apple80211_sup_channel_data *>(data);
-        bzero(d, sizeof(*d)); d->version = APPLE80211_VERSION; d->num_channels = count;
+        bzero(d, sizeof(*d)); d->version = APPLE80211_VERSION;
+        uint32_t n = 0;
         for (uint32_t i = 0; i < count; i++) {
-            d->supported_channels[i].version = APPLE80211_VERSION;
-            d->supported_channels[i].channel = channels[i].number;
-            d->supported_channels[i].flags = APPLE80211_C_FLAG_ACTIVE |
+            if (!rtw88ChannelAllowedInCountry(_countryCode, channels[i].number)) continue;
+            d->supported_channels[n].version = APPLE80211_VERSION;
+            d->supported_channels[n].channel = channels[i].number;
+            d->supported_channels[n].flags = APPLE80211_C_FLAG_ACTIVE |
                 APPLE80211_C_FLAG_20MHZ |
                 (channels[i].number <= 14 ? APPLE80211_C_FLAG_2GHZ : APPLE80211_C_FLAG_5GHZ);
+            n++;
         }
+        d->num_channels = n;
         return kIOReturnSuccess;
     }
 
