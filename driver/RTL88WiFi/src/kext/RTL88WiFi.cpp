@@ -2989,6 +2989,17 @@ IOReturn RTL88WiFi::handleSCAN_RESULT(struct apple80211_scan_result **out)
      * (ni_rsnie_tlv holds every IE), so do the same on Sonoma and keep the
      * RSN-only Ventura contract unchanged. */
     fillScanResultFromBSS(b, &_scanResult, version_major >= 23);
+    /* Report the BSS's advertised operating width (HT/VHT Operation IEs),
+     * using the same parse as the connection chandef.  CURRENT_NETWORK keeps
+     * its conservative flags; the live width is in APPLE80211_IOC_CHANNEL. */
+    RTW88BssOperation op;
+    RTW88IEEE80211::parseBssOperation(b.ies, b.ies_len, &op);
+    uint32_t width = APPLE80211_C_FLAG_20MHZ;
+    if (b.channel > 14 && op.vhtWidth == 1 && op.vhtSeg0 != 0)
+        width = APPLE80211_C_FLAG_80MHZ;
+    else if (op.htStaWidth && (op.sco == 1 || op.sco == 3))
+        width = APPLE80211_C_FLAG_40MHZ | (op.sco == 1 ? APPLE80211_C_FLAG_EXT_ABV : 0);
+    _scanResult.asr_channel.flags = (_scanResult.asr_channel.flags & ~APPLE80211_C_FLAG_20MHZ) | width;
     _scanCursor++;
     setProperty("STA_V24_SCAN_RESULT_CURSOR", (uint64_t)_scanCursor, 32);
     setProperty("STA_V24_SCAN_RESULT_DURING_SCAN", _scanInProgress ? kOSBooleanTrue : kOSBooleanFalse);

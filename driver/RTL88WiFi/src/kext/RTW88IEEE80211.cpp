@@ -2219,6 +2219,27 @@ void RTW88IEEE80211::txStatus(struct sk_buff *skb)
  * 80 MHz VHT AP gives 173 Mbps (20 MHz MCS8) instead of 866 Mbps (80 MHz MCS9).
  * TKIP links stay 20 MHz (HT disallowed — see htAllowed()).
  */
+void RTW88IEEE80211::parseBssOperation(const uint8_t *ies, uint16_t ielen, RTW88BssOperation *op)
+{
+    op->sco = 0;
+    op->htStaWidth = false;
+    op->vhtWidth = 0;
+    op->vhtSeg0 = 0;
+    for (uint16_t i = 0; i + 2 <= ielen; ) {
+        uint8_t id = ies[i], len = ies[i + 1];
+        if ((uint32_t)i + 2 + len > ielen) break;
+        const uint8_t *d = ies + i + 2;
+        if (id == WLAN_EID_HT_OPERATION && len >= 2) {
+            op->sco        = d[1] & 0x03;
+            op->htStaWidth = (d[1] & 0x04) != 0;
+        } else if (id == WLAN_EID_VHT_OPERATION && len >= 3) {
+            op->vhtWidth = d[0];
+            op->vhtSeg0  = d[1];
+        }
+        i += 2 + len;
+    }
+}
+
 void RTW88IEEE80211::setConnectedChandef(struct ieee80211_channel *chan)
 {
     _hw->conf.chandef.chan         = chan;
@@ -2239,25 +2260,12 @@ void RTW88IEEE80211::setConnectedChandef(struct ieee80211_channel *chan)
     bool chip80 = chip40 && bnd == NL80211_BAND_5GHZ && sb->vht_cap.vht_supported;
 
     /* Parse HT/VHT Operation from the cached beacon IEs. */
-    int     sco        = 0;      /* HT secondary-channel offset: 1=above 3=below */
-    bool    htStaWidth = false;  /* HT "STA Channel Width" (40 MHz allowed)      */
-    int     vhtWidth   = 0;      /* VHT op channel width: >=1 means 80 MHz        */
-    uint8_t vhtSeg0    = 0;      /* VHT center-frequency segment 0 (center chan)  */
-    const uint8_t *ies = _targetBSS.ies;
-    uint16_t ielen     = _targetBSS.ies_len;
-    for (uint16_t i = 0; i + 2 <= ielen; ) {
-        uint8_t id = ies[i], len = ies[i + 1];
-        if ((uint32_t)i + 2 + len > ielen) break;
-        const uint8_t *d = ies + i + 2;
-        if (id == WLAN_EID_HT_OPERATION && len >= 2) {
-            sco        = d[1] & 0x03;
-            htStaWidth = (d[1] & 0x04) != 0;
-        } else if (id == WLAN_EID_VHT_OPERATION && len >= 3) {
-            vhtWidth = d[0];
-            vhtSeg0  = d[1];
-        }
-        i += 2 + len;
-    }
+    RTW88BssOperation op;
+    parseBssOperation(_targetBSS.ies, _targetBSS.ies_len, &op);
+    const int     sco        = op.sco;
+    const bool    htStaWidth = op.htStaWidth;
+    const int     vhtWidth   = op.vhtWidth;
+    const uint8_t vhtSeg0    = op.vhtSeg0;
 
     /* 40 MHz (HT). */
     if (chip40 && htStaWidth && (sco == 1 || sco == 3)) {
