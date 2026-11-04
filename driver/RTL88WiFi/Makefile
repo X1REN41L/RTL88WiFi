@@ -1,3 +1,4 @@
+# Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md.
 # Makefile for RTL88WiFi (derived from the upstream rtw88-macos build)
 .DEFAULT_GOAL := rtl88wifi
 #
@@ -333,6 +334,7 @@ AIRPORT_OUT_BIN   := $(AIRPORT_OUT_KEXT)/Contents/MacOS/RTL88WiFi
 
 AIRPORT_KEXT_SRCS := \
     $(KEXT_SRC)/RTW88IEEE80211.cpp \
+    $(KEXT_SRC)/RTW88Security.cpp \
     $(KEXT_SRC)/RTW88HwOps.cpp \
     $(KEXT_SRC)/RTL88WiFi.cpp \
     $(KEXT_SRC)/RTL88WiFiAWDL.cpp \
@@ -343,7 +345,28 @@ AIRPORT_KEXT_OBJS := $(patsubst $(KEXT_SRC)/%.cpp, $(BUILD_DIR)/airport/%.o, $(A
 
 AIRPORT_KMOD_OBJ := $(BUILD_DIR)/airport/kmod_info.o
 
-AIRPORT_ALL_OBJS := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(AIRPORT_KMOD_OBJ) $(AIRPORT_KEXT_OBJS)
+# WPA3: hostap's SAE code on Mbed TLS (../third_party, unmodified subsets),
+# adapted to the kext by src/compat/wpa3 and its stand-in headers.
+WPA3_DIR := $(COMPAT_DIR)/wpa3
+TP_DIR   := $(PROJ_ROOT)/../third_party
+SAE_INC  := -I$(WPA3_DIR)/hostap -I$(TP_DIR)/hostap -I$(TP_DIR)/hostap/src \
+            -I$(TP_DIR)/hostap/src/utils -I$(TP_DIR)/hostap/src/common \
+            -I$(TP_DIR)/mbedtls/include -I$(TP_DIR)/mbedtls/library \
+            -I$(WPA3_DIR) -DMBEDTLS_CONFIG_FILE='"rtw88_mbedtls_config.h"'
+SAE_SRCS := sae.c dragonfly.c rtw88_wpabuf.c bignum.c bignum_core.c ecp.c ecp_curves.c \
+            constant_time.c platform_util.c rtw88_hostap.c rtw88_sae.c rtw88_crypto.c
+SAE_KFLAGS := $(KEXT_FLAGS) -std=gnu11 -DKERNEL -w -I$(WPA3_DIR)/hostap/kernel_libc $(SAE_INC)
+SAE_OBJS := $(patsubst %.c,$(BUILD_DIR)/wpa3/%.o,$(SAE_SRCS))
+vpath %.c $(WPA3_DIR) $(TP_DIR)/hostap/src/common $(TP_DIR)/mbedtls/library
+
+$(BUILD_DIR)/wpa3/%.o: %.c | $(BUILD_DIR)/wpa3
+	@echo "  CC   wpa3/$(notdir $<)"
+	$(CC) $(SAE_KFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/wpa3:
+	mkdir -p $@
+
+AIRPORT_ALL_OBJS := $(DRIVER_OBJS) $(CHIP_OBJS) $(COMPAT_OBJS) $(FIRMWARE_OBJS) $(AIRPORT_KMOD_OBJ) $(AIRPORT_KEXT_OBJS) $(SAE_OBJS)
 
 AIRPORT_LDFLAGS := \
     $(ARCH) -static -nostdlib -Xlinker -kext \
@@ -362,7 +385,7 @@ $(AIRPORT_OUT_BIN): $(AIRPORT_ALL_OBJS) $(AIRPORT_KEXT_SKEL)/Contents/Info.plist
 
 $(BUILD_DIR)/airport/%.o: $(KEXT_SRC)/%.cpp | $(BUILD_DIR)/airport
 	@echo "  CXX  $(notdir $<)"
-	$(CXX) $(KEXT_CXXFLAGS) -D__IO80211_TARGET=__MAC_13_0 -DUSE_APPLE_SUPPLICANT=1 -D__PRIVATE_SPI__ -c $< -o $@
+	$(CXX) $(KEXT_CXXFLAGS) -I$(WPA3_DIR) -D__IO80211_TARGET=__MAC_13_0 -DUSE_APPLE_SUPPLICANT=1 -D__PRIVATE_SPI__ -c $< -o $@
 
 $(AIRPORT_KMOD_OBJ): $(KEXT_SRC)/kmod_info.c | $(BUILD_DIR)/airport
 	@echo "  CC   airport/kmod_info.c"

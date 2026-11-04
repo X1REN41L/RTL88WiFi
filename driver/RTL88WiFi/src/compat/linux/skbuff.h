@@ -1,3 +1,4 @@
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 #ifndef _RTW88_COMPAT_SKBUFF_H
 #define _RTW88_COMPAT_SKBUFF_H
@@ -167,9 +168,17 @@ static inline void consume_skb(struct sk_buff *skb)
 }
 
 /* Data manipulation */
+
+/* Like Linux's skb_over_panic()/skb_under_panic(): writing past either end of
+ * the buffer is heap corruption, so stop at the call that would do it. */
+void rtw88_skb_panic(const struct sk_buff *skb, u32 len, const char *what)
+    __attribute__((noreturn));
+
 static inline u8 *skb_put(struct sk_buff *skb, u32 len)
 {
     u8 *tmp = skb->tail;
+    if (len > (u32)(skb->end - skb->tail))
+        rtw88_skb_panic(skb, len, "skb_put");
     skb->tail += len;
     skb->len  += len;
     return tmp;
@@ -190,6 +199,8 @@ static inline void skb_put_data(struct sk_buff *skb, const void *data, u32 len)
 
 static inline u8 *skb_push(struct sk_buff *skb, u32 len)
 {
+    if (len > (u32)(skb->data - skb->head))
+        rtw88_skb_panic(skb, len, "skb_push");
     skb->data -= len;
     skb->len  += len;
     return skb->data;
@@ -228,11 +239,15 @@ static inline u32 skb_tailroom(const struct sk_buff *skb)
 
 static inline struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t prio)
 {
-    struct sk_buff *n = alloc_skb(skb->len + skb_headroom(skb), prio);
+    /* Keep the original's head- and tailroom, as Linux does. */
+    struct sk_buff *n = alloc_skb((u32)(skb->end - skb->head), prio);
     if (!n) return NULL;
     skb_reserve(n, skb_headroom(skb));
     memcpy(skb_put(n, skb->len), skb->data, skb->len);
     memcpy(n->cb, skb->cb, sizeof(n->cb));
+    n->protocol = skb->protocol;
+    n->priority = skb->priority;
+    n->queue_mapping = skb->queue_mapping;
     return n;
 }
 

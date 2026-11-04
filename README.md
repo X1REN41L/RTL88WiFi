@@ -1,17 +1,16 @@
 # RTL88WiFi
 
-Native macOS Wi-Fi for Realtek **RTL8821CE, RTL8822BE and RTL8822CE** PCIe cards
-on Hackintosh. The card works like a Mac's AirPort card: it shows up in the
-Wi-Fi menu, auto-joins and reconnects after sleep. SIP stays enabled, and no
-client app is needed.
+Native macOS Wi-Fi for the Realtek **RTL8821CE** PCIe card on Hackintosh. The
+card works like a Mac's AirPort card: it shows up in the Wi-Fi menu, auto-joins
+and reconnects after sleep. SIP stays enabled, and no client app is needed.
+RTL8822BE and RTL8822CE support is also in the driver, but has never been
+tested.
 
 > [!IMPORTANT]
-> **Discontinued.** Development stopped after version 1.0.0. Version 1.0.1 is
-> a final maintenance release that only corrects what System Information
-> reports (transmit rate, noise, channel widths, supported channels); see
-> [CHANGELOG](CHANGELOG.md). The driver stays usable as is, but the
-> [remaining issues](#remaining-issues) will not be fixed. Keep a bootable EFI
-> backup on USB.
+> **Development continues, and 1.1.0 is untested.** The 1.1.0 source adds WPA3,
+> Enterprise and hidden networks but has never been run on hardware. 1.0.1 is the
+> last version known to work, and the prebuilt kext in `Kexts/` is 1.0.0. See the
+> [CHANGELOG](CHANGELOG.md). Keep a bootable EFI backup on USB.
 
 <p align="center">
   <img src="docs/images/speedtest-2.0.1.png" alt="RTL8821CE speed test: 93.40 Mbps down, 92.45 Mbps up" width="380">
@@ -21,18 +20,23 @@ On a 100 Mbps line, RTL8821CE on Sonoma reaches 86–93 Mbps down and 89–105 M
 up. The link held through load tests and sleep/wake. Before these fixes, the
 same card managed 7 Mbps and kept disconnecting.
 
+It also runs well on Sequoia: with 1.0.1 on macOS 15.8.2, one `networkQuality`
+run measured 88.8 Mbps down and 95.0 Mbps up on channel 36, with no router ping
+loss. Sleep/wake was not part of that run.
+
 ## Compatibility
 
 | Chip | PCI ID | Status |
 |---|---|---|
 | RTL8821CE | `10ec:c821`, `10ec:b821` | ✅ Verified |
-| RTL8822BE | `10ec:b822` | 🟡 Supported, needs reports |
-| RTL8822CE | `10ec:c822`, `10ec:c82f` | 🟡 Supported, needs reports |
+| RTL8822BE | `10ec:b822` | 🟡 Untested, needs reports |
+| RTL8822CE | `10ec:c822`, `10ec:c82f` | 🟡 Untested, needs reports |
 
 | macOS | Status |
 |---|---|
 | Sonoma 14 | ✅ Verified on 14.8.9 |
-| Sequoia 15 / Tahoe 26 | 🟡 Same setup, needs reports |
+| Sequoia 15 | ✅ Verified on 15.8.2 with RTL8821CE and 1.0.1 |
+| Tahoe 26 | 🟡 Same setup, needs reports |
 | Ventura 13.7.7–13.7.8 | 🟡 Add only `RTL88WiFi.kext` (no other kexts or Block entry), needs reports |
 | Monterey and older | ❌ |
 
@@ -55,13 +59,26 @@ It ends with a report block (without MAC, IP or network name) for a
 networks, 2.4 and 5 GHz (80 MHz), Wi-Fi menu and auto-join, network switching,
 group rekeys, sleep/wake.
 
-**Doesn't work:** WPA3-only, Enterprise, hidden networks, AirDrop and
-Continuity (AWDL). Bluetooth is a separate device and is not covered. TKIP is
-untested.
+**Doesn't work:** AirDrop and Continuity (AWDL). Bluetooth is a separate device
+and is not covered. TKIP is untested.
+
+**In the 1.1.0 source, never run on hardware:** WPA3-only (SAE), protected
+management frames, WPA2-Enterprise, hidden networks, scanning while connected
+and the link monitor. Build from source to get them; the kexts in `Kexts/` do
+not include them. See the [CHANGELOG](CHANGELOG.md).
+
+Optional boot-args for 1.1.0, none needed by default:
+
+| Boot-arg | Effect |
+|---|---|
+| `-rtl88nowpa3` | Turn WPA3 off |
+| `-rtl88saemixed` | Use SAE on WPA2/WPA3 mixed networks instead of WPA2 |
+| `-rtl88nobgscan` | No scanning at all while connected; the Wi-Fi menu only learns of new networks after a disconnect |
+| `-rtl88noawdl` | No `awdl0`, so no off-channel AWDL windows |
 
 ## Remaining issues
 
-These are known and will not be fixed:
+These are known and still open:
 
 - **Upload drops.** Heavy parallel uploads overflow macOS's 256-packet Wi-Fi
   output queue (about 1–4% drops in `networkQuality`, much more in some
@@ -78,10 +95,11 @@ These are known and will not be fixed:
 - **"Hidden" network label.** Fixed after wake; after switching networks,
   macOS may still label the network as hidden. The connection is not
   affected.
-- **Unsupported security and joins:** WPA3-only (SAE), Enterprise/802.1X,
-  OWE, PMF-required networks and joining hidden networks. TKIP is untested.
+- **Unsupported security:** OWE, and Enterprise networks that require protected
+  management frames. TKIP is untested. 1.0.1 and the kexts in `Kexts/` also lack
+  everything listed under 1.1.0 above.
 - **Untested hardware and systems:** RTL8822BE/CE, macOS other than Sonoma
-  14.8.9, roaming, and long standby/hibernate.
+  14.8.9 and Sequoia 15.8.2, roaming, and long standby/hibernate.
 - **System Information leftovers.** AirDrop and Auto Unlock are listed as
   "Supported" but do not work. Card Type shows the card's PCI subsystem ID,
   not its device ID. RTL8821CE reports no noise value.
@@ -131,10 +149,11 @@ Changes: [CHANGELOG.md](CHANGELOG.md).
 
 ## Status
 
-Discontinued: no further development, fixes or releases are planned. The
-source is GPL-2.0, so anyone may fork it and continue.
+In development, focused on RTL8821CE. 1.1.0 is built and passes the host tests,
+but has not been run on hardware. The source is GPL-2.0.
 
-Tested on an HP 15-da0003tu (i3-8130U), OpenCore 1.0.7, macOS 14.8.9.
+Tested on an HP 15-da0003tu (i3-8130U), OpenCore 1.0.7, macOS 14.8.9. Also
+running on macOS 15.8.2 (i3-8130U, HP subsystem `103c:831a`) with 1.0.1.
 
 ## License
 

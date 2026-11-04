@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess, tempfile
 
 root=Path(__file__).resolve().parents[1]/'driver/RTL88WiFi'
-s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()
+s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()+(root/'src/kext/RTW88Security.cpp').read_text()
 def fn(signature):
     start=s.index(signature);i=s.index('{',start)+1;depth=1
     while depth:
@@ -50,6 +50,8 @@ public:
  bool _m3KeysInstalled=false,_externalPTKInstalled=false,_externalSupplicant=false,_rxCcmpIvSkipLogged=false;
  uint32_t _rxUndecryptedProtected=0,_rxUnprotectedDropped=0,_rxNonSnapDropped=0,_rxAmsduSpoofDropped=0,_rxTrailerChecks=0;
  unsigned _state=RTW88_STATE_CONNECTED,_scanReturnState=0;
+ bool _enterprise=false,_pmkProvided=false;uint8_t _heldM1[512]={};uint16_t _heldM1Len=0;
+ void rxEapolKey(const uint8_t*,uint32_t);
  struct{uint32_t cipher=WLAN_CIPHER_SUITE_CCMP,group_cipher=WLAN_CIPHER_SUITE_CCMP;}_targetBSS;
  void deliverDataFrame(sk_buff*);void deAmsdu(const uint8_t*,uint32_t);
  void deliverEthernet(const uint8_t*,const uint8_t*,uint16_t t,const uint8_t*p,uint32_t n){out.push_back({t,std::vector<uint8_t>(p,p+n)});}
@@ -69,6 +71,17 @@ static std::vector<uint8_t> msdu(uint16_t type,const std::vector<uint8_t>&p){std
 static std::vector<uint8_t> sub(const std::vector<uint8_t>&m,uint8_t da0,bool pad){std::vector<uint8_t> v(12,0);v[0]=da0;v.push_back(m.size()>>8);v.push_back(m.size()&0xff);v.insert(v.end(),m.begin(),m.end());while(pad&&v.size()%4)v.push_back(0);return v;}
 int main(){
  RTW88IEEE80211 c;c._m3KeysInstalled=true;
+ // 0. 802.1X before the 4-way handshake: no key yet, link up. Forged plaintext data stops here; EAP goes up, key frames to the handshake.
+ {RTW88IEEE80211 e;e._enterprise=true;std::vector<uint8_t> eap(99,0);eap[1]=0;std::vector<uint8_t> ekey(99,0);ekey[1]=3;
+  out.clear();e.deliverDataFrame(frame(false,false,true,false,false,msdu(ETH_P_IP,ipv4(100)),0));e.deliverDataFrame(frame(false,false,false,false,false,msdu(ETH_P_IP,ipv4(100)),0));
+  assert(out.empty()&&e._rxUnprotectedDropped==2);
+  e.deliverDataFrame(frame(false,false,true,true,false,sub(msdu(ETH_P_IP,ipv4(40)),2,false),0));assert(out.empty()&&e._rxUnprotectedDropped==3);
+  e.deliverDataFrame(frame(false,false,true,false,false,msdu(ETH_P_PAE,eap),0));assert(out.size()==1&&out[0].type==ETH_P_PAE);
+  size_t k0=eapol.size();e._pmkProvided=true;e.deliverDataFrame(frame(false,false,true,false,false,msdu(ETH_P_PAE,ekey),0));assert(out.size()==1&&eapol.size()==k0+1);
+  // After the handshake, protected traffic flows.
+  e._m3KeysInstalled=true;e.deliverDataFrame(frame(true,true,true,false,false,msdu(ETH_P_IP,ipv4(100)),8));assert(out.size()==2&&out[1].type==ETH_P_IP);out.clear();}
+ // 0b. Not keyed and not 802.1X (the open-network case): plaintext data is the normal path.
+ {RTW88IEEE80211 o;out.clear();o.deliverDataFrame(frame(false,false,true,false,false,msdu(ETH_P_IP,ipv4(100)),0));assert(out.size()==1);out.clear();}
  // 1. CCMP unicast: MIC trimmed, payload exact, trailer check extra=0
  out.clear();c.deliverDataFrame(frame(true,true,true,false,false,msdu(ETH_P_IP,ipv4(100)),8));
  assert(out.size()==1&&out[0].type==ETH_P_IP&&out[0].payload.size()==100&&c._rxTrailerChecks==1);
@@ -110,7 +123,7 @@ int main(){
 }
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-rxfilter-') as td:
-    p=Path(td);(p/'test.cpp').write_text(prefix+fn('void RTW88IEEE80211::deliverDataFrame(')+'\n'+fn('void RTW88IEEE80211::deAmsdu(')+main)
+    p=Path(td);(p/'test.cpp').write_text(prefix+fn('void RTW88IEEE80211::deliverDataFrame(')+'\n'+fn('void RTW88IEEE80211::deAmsdu(')+'\n'+fn('void RTW88IEEE80211::rxEapolKey(')+main)
     subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=all','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
     r=subprocess.run([str(p/'test')],capture_output=True,text=True)
     print('\n'.join(l for l in r.stdout.splitlines() if l.startswith('PASS') or 'trailer check' in l))

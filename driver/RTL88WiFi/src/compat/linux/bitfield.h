@@ -1,3 +1,4 @@
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause */
 #ifndef _RTW88_COMPAT_BITFIELD_H
 #define _RTW88_COMPAT_BITFIELD_H
@@ -79,7 +80,7 @@ static inline void le32p_replace_bits(__le32 *p, u32 val, u32 mask)
 }
 static inline u64 le64_get_bits(__le64 v, u64 mask)
 {
-    return u64_encode_bits((u64)v & mask, mask);
+    return (u64)FIELD_GET(mask, (u64)v);
 }
 
 #endif /* _RTW88_COMPAT_BITFIELD_H */

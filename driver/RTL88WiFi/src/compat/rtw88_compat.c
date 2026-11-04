@@ -1,4 +1,4 @@
-/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Compatibility layer implementation for rtw88 macOS port.
 // Compiled as C with -mkernel; no userspace headers allowed.
@@ -379,6 +379,74 @@ void flush_scheduled_work(void)
 /*  Timer implementation (thread_call)                                  */
 /* ------------------------------------------------------------------ */
 
+/*
+ * Every thread_call a timer has allocated. A call that is still allocated when
+ * the kext unloads would fire into unmapped code, so rtw88_compat_exit() stops
+ * and frees whatever the driver did not delete with del_timer_sync().
+ */
+struct timer_call_node {
+    thread_call_t call;
+    struct timer_call_node *next;
+};
+static struct timer_call_node *timer_calls;
+static IOLock *timer_calls_lock;
+
+static void timer_call_track(thread_call_t call)
+{
+    struct timer_call_node *node = (struct timer_call_node *)IOMalloc(sizeof(*node));
+
+    if (!node || !timer_calls_lock)
+        return;
+    node->call = call;
+    IOLockLock(timer_calls_lock);
+    node->next = timer_calls;
+    timer_calls = node;
+    IOLockUnlock(timer_calls_lock);
+}
+
+static void timer_call_untrack(thread_call_t call)
+{
+    struct timer_call_node **pp, *node = NULL;
+
+    if (!timer_calls_lock)
+        return;
+    IOLockLock(timer_calls_lock);
+    for (pp = &timer_calls; *pp; pp = &(*pp)->next) {
+        if ((*pp)->call == call) {
+            node = *pp;
+            *pp = node->next;
+            break;
+        }
+    }
+    IOLockUnlock(timer_calls_lock);
+    if (node)
+        IOFree(node, sizeof(*node));
+}
+
+static void timer_calls_reap(void)
+{
+    struct timer_call_node *node;
+    unsigned int n = 0;
+
+    if (!timer_calls_lock)
+        return;
+    for (;;) {
+        IOLockLock(timer_calls_lock);
+        node = timer_calls;
+        if (node)
+            timer_calls = node->next;
+        IOLockUnlock(timer_calls_lock);
+        if (!node)
+            break;
+        thread_call_cancel_wait(node->call);
+        thread_call_free(node->call);
+        IOFree(node, sizeof(*node));
+        n++;
+    }
+    if (n)
+        IOLog("rtw88: stopped %u timer(s) left armed or undeleted at exit\n", n);
+}
+
 static void timer_call_fn(thread_call_param_t p0, thread_call_param_t p1)
 {
     struct timer_list *timer = (struct timer_list *)p0;
@@ -405,8 +473,12 @@ int mod_timer(struct timer_list *timer, unsigned long expires)
     int was_active = timer->active;
 
     if (!timer->call)
+    {
         timer->call = thread_call_allocate(timer_call_fn,
                                             (thread_call_param_t)timer);
+        if (timer->call)
+            timer_call_track(timer->call);
+    }
 
     if (!timer->call) return was_active;
 
@@ -434,6 +506,7 @@ int del_timer_sync(struct timer_list *timer)
     timer->active = 0;
     if (timer->call) {
         thread_call_cancel_wait(timer->call);
+        timer_call_untrack(timer->call);
         thread_call_free(timer->call);
         timer->call = NULL;
     }
@@ -1085,6 +1158,7 @@ int rtw88_compat_init(void)
     if (system_wq || system_long_wq || g_datapath_wq || rtw88_log_lock)
         return -EBUSY;
 
+    timer_calls_lock = IOLockAlloc();
     work_state_lock = IOLockAlloc();
     if (!work_state_lock) return -ENOMEM;
     rtw88_log_lock = IOSimpleLockAlloc();
@@ -1109,8 +1183,17 @@ int rtw88_compat_init(void)
     return 0;
 }
 
+void rtw88_skb_panic(const struct sk_buff *skb, u32 len, const char *what)
+{
+    IOLog("rtw88 BUG: %s: %u bytes do not fit (len %u, headroom %ld, tailroom %ld)\n",
+          what, len, skb->len, (long)(skb->data - skb->head), (long)(skb->end - skb->tail));
+    __builtin_trap();
+}
+
 void rtw88_compat_exit(void)
 {
+    timer_calls_reap();
+    if (timer_calls_lock) { IOLockFree(timer_calls_lock); timer_calls_lock = NULL; }
     if (g_irq_work_initialized)
         cancel_work_sync(&g_irq_work);
     destroy_workqueue(g_datapath_wq);
@@ -1276,6 +1359,22 @@ bool rtw88_is_scanning(void)
     if (!g_rtw88_hw || !g_rtw88_hw->priv) return false;
     struct rtw_dev *rtwdev = (struct rtw_dev *)g_rtw88_hw->priv;
     return test_bit(RTW_FLAG_SCANNING, rtwdev->flags);
+}
+
+/* The access point's country picks the TX power tables, as a country-IE
+ * regulatory hint does on Linux.  rtw88's notifier ignores it on a card whose
+ * country is programmed in the efuse. */
+void rtw88_regd_set_country(struct ieee80211_hw *hw, const char *alpha2)
+{
+    struct regulatory_request req;
+
+    if (!hw || !hw->wiphy || !hw->wiphy->reg_notifier || !alpha2)
+        return;
+    memset(&req, 0, sizeof(req));
+    req.alpha2[0] = alpha2[0];
+    req.alpha2[1] = alpha2[1];
+    req.initiator = NL80211_REGDOM_SET_BY_COUNTRY_IE;
+    hw->wiphy->reg_notifier(hw->wiphy, &req);
 }
 
 bool rtw88_hw_scan_supported(struct ieee80211_hw *hw)

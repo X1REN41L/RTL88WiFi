@@ -1,4 +1,4 @@
-/* Modified by X1REN41L on 2026-10-02 for RTL88WiFi 1.0.0; see the repository NOTICE.md. */
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * RTL88WiFi.hpp — IO80211Controller subclass; native Wi-Fi menu support
  * for the rtw88 macOS port, following the established IO80211 controller
@@ -225,6 +225,23 @@ private:
     IOReturn handleAUTH_TYPE(bool set, struct apple80211_authtype_data *data);
     IOReturn handleASSOCIATE(struct apple80211_assoc_data *data);
     IOReturn handleRSN_IE(bool set, struct apple80211_rsn_ie_data *data);
+    IOReturn startScanRequest(const uint8_t *ssid, size_t ssidLen,
+                              const uint8_t *channels, uint32_t nChannels);
+    uint64_t _lastBgScanMs = 0;
+    uint64_t _lastNamedScanMs = 0;
+    char     _joinPass[65] = {};
+    uint8_t  _joinPassLen = 0;
+public:
+    /* The passphrase of the join request being decoded (NULL: wipe it). */
+    void setJoinPassphrase(const uint8_t *pass, size_t len) {
+        bzero(_joinPass, sizeof(_joinPass));
+        _joinPassLen = 0;
+        if (pass && len && len < sizeof(_joinPass)) {
+            memcpy(_joinPass, pass, len);
+            _joinPassLen = (uint8_t)len;
+        }
+    }
+private:
     IOReturn handleAP_IE_LIST(struct apple80211_ap_ie_data *data);
     IOReturn handleCIPHER_KEY(struct apple80211_key *key);
     IOReturn handleDISASSOCIATE();

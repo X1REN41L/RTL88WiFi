@@ -1,5 +1,5 @@
-/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
-// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
+// SPDX-License-Identifier: GPL-2.0
 // RTW88IEEE80211.cpp — 802.11 state machine
 
 #include "RTW88IEEE80211.hpp"
@@ -34,6 +34,9 @@ void rtw_tx(struct rtw_dev *rtwdev, struct ieee80211_tx_control *control,
 /* PCI probe shim declared in pci.c */
 int  rtw_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id);
 void rtw_pci_remove(struct pci_dev *pdev);
+
+#include "rtw88_crypto.h"
+#include "rtw88_sae.h"
 
 /* Exported from the compat layer for hooking */
 void rtw88_set_hw_callbacks(struct rtw88_hw_callbacks *cbs, void *kext_hw);
@@ -258,6 +261,26 @@ static void derivePTK(const uint8_t pmk[32], const uint8_t anonce[32], const uin
     }
 }
 
+/* The key handshake by EAPOL-Key version: 2 is the HMAC-SHA1 path above;
+ * PSK-SHA256 and SAE take KDF-SHA-256 and AES-CMAC (12.7.1.3, 12.7.2). */
+static void derivePTKForVersion(uint8_t ver, const uint8_t pmk[32], const uint8_t anonce[32],
+                                const uint8_t snonce[32], const uint8_t spa[6],
+                                const uint8_t aa[6], uint8_t ptk[64])
+{
+    if (ver == 2) {
+        derivePTK(pmk, anonce, snonce, spa, aa, ptk);
+        return;
+    }
+    uint8_t data[76];
+    const bool aaFirst = memcmp(aa, spa, 6) < 0, anFirst = memcmp(anonce, snonce, 32) < 0;
+    memcpy(data, aaFirst ? aa : spa, 6);
+    memcpy(data + 6, aaFirst ? spa : aa, 6);
+    memcpy(data + 12, anFirst ? anonce : snonce, 32);
+    memcpy(data + 44, anFirst ? snonce : anonce, 32);
+    memset(ptk, 0, 64);
+    rtw88_kdf_sha256(pmk, 32, "Pairwise key expansion", data, sizeof(data), ptk, 48);
+}
+
 static const uint8_t aes_sbox[256] = {
     0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
     0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -441,6 +464,25 @@ static bool eapol_mic_ok(const uint8_t kck[16], const uint8_t *eapol,
     return memcmp(rx_mic, mic, sizeof(rx_mic)) == 0;
 }
 
+static bool eapol_mic_ok_for_version(uint8_t ver, const uint8_t kck[16],
+                                     const uint8_t *eapol, uint32_t eapol_len)
+{
+    if (ver == 2)
+        return eapol_mic_ok(kck, eapol, eapol_len);
+    if (eapol_len < 99)
+        return false;
+    uint8_t *tmp = (uint8_t *)IOMalloc(eapol_len);
+    if (!tmp)
+        return false;
+    memcpy(tmp, eapol, eapol_len);
+    uint8_t rx_mic[16], mic[16];
+    memcpy(rx_mic, tmp + 81, sizeof(rx_mic));
+    memset(tmp + 81, 0, sizeof(rx_mic));
+    rtw88_aes_cmac(kck, tmp, eapol_len, mic);
+    IOFree(tmp, eapol_len);
+    return memcmp(rx_mic, mic, sizeof(mic)) == 0;
+}
+
 static bool extract_gtk_from_kde(const uint8_t *key_data, uint16_t key_data_len,
                                  uint8_t gtk[32], uint8_t *gtk_len,
                                  uint8_t *gtk_idx)
@@ -562,7 +604,11 @@ bool RTW88IEEE80211::init(RTW88RxDelegate *delegate, struct pci_dev *pci)
                                        (thread_call_param_t)this);
     _manualScanTC = thread_call_allocate((thread_call_func_t)RTW88IEEE80211::manualScanTCFn,
                                          (thread_call_param_t)this);
-    if (!_connectTC || !_manualScanTC) return false;
+    _saeTC = thread_call_allocate((thread_call_func_t)RTW88IEEE80211::saeTCFn,
+                                  (thread_call_param_t)this);
+    _saeLock = IOLockAlloc();
+    _saeOpLock = IOLockAlloc();
+    if (!_connectTC || !_manualScanTC || !_saeTC || !_saeLock || !_saeOpLock) return false;
     /* Install callbacks into compat layer */
     static struct rtw88_hw_callbacks cbs = {
         .rx_frame  = RTW88IEEE80211::compat_rx_frame,
@@ -592,6 +638,16 @@ bool RTW88IEEE80211::init(RTW88RxDelegate *delegate, struct pci_dev *pci)
         &RTW88IEEE80211::reorderTimerFired);
     if (!_reorderTimer) return false;
     if (rxwl->addEventSource(_reorderTimer) != kIOReturnSuccess) return false;
+    _heldM1Timer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::heldM1TimerFired);
+    if (!_heldM1Timer || rxwl->addEventSource(_heldM1Timer) != kIOReturnSuccess) return false;
+    /* Both tear the link down as the deauth handler does: same workloop. */
+    _monitorTimer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::monitorTimerFired);
+    if (!_monitorTimer || rxwl->addEventSource(_monitorTimer) != kIOReturnSuccess) return false;
+    _joinFailTimer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::joinFailTimerFired);
+    if (!_joinFailTimer || rxwl->addEventSource(_joinFailTimer) != kIOReturnSuccess) return false;
     IOLog("rtw88: RTW88IEEE80211 initialized\n");
     return true;
 }
@@ -610,7 +666,11 @@ bool RTW88IEEE80211::init(RTW88PCIDevice *dev, struct pci_dev *pci)
                                        (thread_call_param_t)this);
     _manualScanTC = thread_call_allocate((thread_call_func_t)RTW88IEEE80211::manualScanTCFn,
                                           (thread_call_param_t)this);
-    if (!_connectTC || !_manualScanTC) return false;
+    _saeTC = thread_call_allocate((thread_call_func_t)RTW88IEEE80211::saeTCFn,
+                                  (thread_call_param_t)this);
+    _saeLock = IOLockAlloc();
+    _saeOpLock = IOLockAlloc();
+    if (!_connectTC || !_manualScanTC || !_saeTC || !_saeLock || !_saeOpLock) return false;
 
     /* Install callbacks into compat layer */
     static struct rtw88_hw_callbacks cbs = {
@@ -645,6 +705,16 @@ bool RTW88IEEE80211::init(RTW88PCIDevice *dev, struct pci_dev *pci)
         &RTW88IEEE80211::reorderTimerFired);
     if (!_reorderTimer) return false;
     if (rxwl->addEventSource(_reorderTimer) != kIOReturnSuccess) return false;
+    _heldM1Timer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::heldM1TimerFired);
+    if (!_heldM1Timer || rxwl->addEventSource(_heldM1Timer) != kIOReturnSuccess) return false;
+    /* Both tear the link down as the deauth handler does: same workloop. */
+    _monitorTimer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::monitorTimerFired);
+    if (!_monitorTimer || rxwl->addEventSource(_monitorTimer) != kIOReturnSuccess) return false;
+    _joinFailTimer = IOTimerEventSource::timerEventSource(this,
+        &RTW88IEEE80211::joinFailTimerFired);
+    if (!_joinFailTimer || rxwl->addEventSource(_joinFailTimer) != kIOReturnSuccess) return false;
 
     IOLog("rtw88: RTW88IEEE80211 initialized\n");
     return true;
@@ -655,14 +725,41 @@ void RTW88IEEE80211::free()
     _manualScanAbort = true;
     if (_manualScanTC) { thread_call_cancel_wait(_manualScanTC); thread_call_free(_manualScanTC); _manualScanTC = nullptr; }
     if (_connectTC) { thread_call_cancel_wait(_connectTC); thread_call_free(_connectTC); _connectTC = nullptr; }
+    if (_saeTC) { thread_call_cancel_wait(_saeTC); thread_call_free(_saeTC); _saeTC = nullptr; }
+    if (_saeLock) { saeFlushQueue(); IOLockFree(_saeLock); _saeLock = nullptr; }
+    if (_saeOpLock) { IOLockFree(_saeOpLock); _saeOpLock = nullptr; }
+    saeEnd();
 
     /* The compat layer keeps a raw callback context.  Clear it before this
      * object can disappear so a late RX/TX completion cannot call freed memory. */
     rtw88_set_hw_callbacks(nullptr, nullptr);
     clearKeys();
+    freeRetiredKey(&_retiredPtk);
+    freeRetiredKey(&_retiredGtk);
     releaseSta();
     if (_rxBaLock)
         rxBaTeardownAll();
+    if (_heldM1Timer) {
+        IOWorkLoop *rxwl = _parent ? _parent->getRxWorkLoop() : nullptr;
+        _heldM1Timer->cancelTimeout();
+        if (rxwl) rxwl->removeEventSource(_heldM1Timer);
+        _heldM1Timer->release();
+        _heldM1Timer = nullptr;
+    }
+    if (_monitorTimer) {
+        IOWorkLoop *rxwl = _parent ? _parent->getRxWorkLoop() : nullptr;
+        _monitorTimer->cancelTimeout();
+        if (rxwl) rxwl->removeEventSource(_monitorTimer);
+        _monitorTimer->release();
+        _monitorTimer = nullptr;
+    }
+    if (_joinFailTimer) {
+        IOWorkLoop *rxwl = _parent ? _parent->getRxWorkLoop() : nullptr;
+        _joinFailTimer->cancelTimeout();
+        if (rxwl) rxwl->removeEventSource(_joinFailTimer);
+        _joinFailTimer->release();
+        _joinFailTimer = nullptr;
+    }
     if (_reorderTimer) {
         IOWorkLoop *rxwl = _parent ? _parent->getRxWorkLoop() : nullptr;
         if (rxwl) rxwl->removeEventSource(_reorderTimer);
@@ -688,23 +785,39 @@ void RTW88IEEE80211::free()
     super::free();
 }
 
+/* Whoever takes the key off the slot removes it, so two teardowns cannot both
+ * do so.  TX and RX read the slot without a lock, and a frame being built still
+ * holds the pointer: the memory stays, with the key in it (a frame in flight is
+ * not sent under a zero key), for the next install or free() to overwrite. */
+void RTW88IEEE80211::retireKey(struct ieee80211_key_conf **slot,
+                               struct ieee80211_key_conf **retired,
+                               struct ieee80211_sta *sta)
+{
+    struct ieee80211_key_conf *key = __atomic_exchange_n(slot, nullptr, __ATOMIC_ACQ_REL);
+    if (!key)
+        return;
+    if (_powered && _hw && _hw->ops && _hw->ops->set_key)
+        _hw->ops->set_key(_hw, DISABLE_KEY, _vif, sta, key);
+    struct ieee80211_key_conf *old = __atomic_exchange_n(retired, key, __ATOMIC_ACQ_REL);
+    if (old) {
+        bzero(old, sizeof(*old));
+        IOFree(old, sizeof(*old));
+    }
+}
+
+void RTW88IEEE80211::freeRetiredKey(struct ieee80211_key_conf **retired)
+{
+    struct ieee80211_key_conf *key = __atomic_exchange_n(retired, nullptr, __ATOMIC_ACQ_REL);
+    if (key) {
+        bzero(key, sizeof(*key));
+        IOFree(key, sizeof(*key));
+    }
+}
+
 void RTW88IEEE80211::clearKeys()
 {
-    if (_powered && _hw && _hw->ops && _hw->ops->set_key) {
-        if (_ptkConf)
-            _hw->ops->set_key(_hw, DISABLE_KEY, _vif, _sta, _ptkConf);
-        if (_gtkConf)
-            _hw->ops->set_key(_hw, DISABLE_KEY, _vif, nullptr, _gtkConf);
-    }
-
-    if (_ptkConf) {
-        IOFree(_ptkConf, sizeof(*_ptkConf));
-        _ptkConf = nullptr;
-    }
-    if (_gtkConf) {
-        IOFree(_gtkConf, sizeof(*_gtkConf));
-        _gtkConf = nullptr;
-    }
+    retireKey(&_ptkConf, &_retiredPtk, _sta);
+    retireKey(&_gtkConf, &_retiredGtk, nullptr);
     memset(_pmk, 0, sizeof(_pmk));
     memset(_password, 0, sizeof(_password));
     _pmkProvided = false;
@@ -773,14 +886,14 @@ bool RTW88IEEE80211::installKey(struct ieee80211_key_conf **slot, bool pairwise,
               pairwise ? "PTK" : "GTK", keyidx);
         return true;
     }
-    if (*slot) {
-        _hw->ops->set_key(_hw, DISABLE_KEY, _vif, pairwise ? _sta : nullptr, *slot);
-        IOFree(*slot, sizeof(**slot));
-        *slot = nullptr;
-    }
+    struct ieee80211_key_conf **retired = pairwise ? &_retiredPtk : &_retiredGtk;
+    retireKey(slot, retired, pairwise ? _sta : nullptr);
 
-    struct ieee80211_key_conf *key =
-        (struct ieee80211_key_conf *)IOMallocZero(sizeof(*key));
+    struct ieee80211_key_conf *key = __atomic_exchange_n(retired, nullptr, __ATOMIC_ACQ_REL);
+    if (key)
+        bzero(key, sizeof(*key));
+    else
+        key = (struct ieee80211_key_conf *)IOMallocZero(sizeof(*key));
     if (!key)
         return false;
 
@@ -796,13 +909,18 @@ bool RTW88IEEE80211::installKey(struct ieee80211_key_conf **slot, bool pairwise,
     if (ret) {
         IOLog("rtw88: failed to install %s %s key ret=%d\n",
               pairwise ? "pairwise" : "group", rtw88CipherName(cipher), ret);
+        bzero(key, sizeof(*key));
         IOFree(key, sizeof(*key));
         return false;
     }
 
-    *slot = key;
-    if (pairwise)
+    __atomic_store_n(slot, key, __ATOMIC_RELEASE);
+    if (pairwise) {
         memset(_ccmpTxPn, 0, sizeof(_ccmpTxPn));
+        /* A new PTK restarts the AP's packet numbers too. */
+        _mgmtRxPnValid = false;
+        _mgmtRxPn = 0;
+    }
     IOLog("rtw88: installed %s %s key idx=%u hw_idx=%u\n",
           pairwise ? "pairwise" : "group", rtw88CipherName(cipher),
           keyidx, key->hw_key_idx);
@@ -944,6 +1062,9 @@ void RTW88IEEE80211::stop()
     _manualScanAbort = true;
     if (_manualScanTC) thread_call_cancel_wait(_manualScanTC);
     if (_connectTC) thread_call_cancel_wait(_connectTC);
+    if (_saeTC) thread_call_cancel_wait(_saeTC);
+    if (_monitorTimer) _monitorTimer->cancelTimeout();
+    if (_heldM1Timer) _heldM1Timer->cancelTimeout();
     if (_reorderTimer) { _reorderTimer->cancelTimeout(); _reorderTimer->disable(); }
     if (_timer)
         _timer->cancelTimeout();
@@ -1224,7 +1345,8 @@ UInt32 RTW88IEEE80211::outputPacket(mbuf_t m)
 
     /* Apple RSN needs the BSD link marked up to exchange EAPOL, but before
      * PTK+GTK are installed the controlled port must carry EAPOL only. */
-    if (_wpa2 && _externalSupplicant && !externalKeysReady()) {
+    if (_wpa2 && ((_externalSupplicant && !externalKeysReady()) ||
+                  (_enterprise && !_m3KeysInstalled))) {
         uint8_t eh[14] = {};
         if (mbuf_pkthdr_len(m) < sizeof(eh) ||
             mbuf_copydata(m, 0, sizeof(eh), eh) != 0 ||
@@ -1257,8 +1379,11 @@ void RTW88IEEE80211::rxFrame(struct sk_buff *skb)
     }
     if (rtw88StationSignal(skb->data, skb->len, _macAddr, _targetBSS.bssid,
                           rxs->signal,
-                          (rxs->flag & (RX_FLAG_NO_SIGNAL_VAL | RX_FLAG_FAILED_FCS_CRC)) != 0))
+                          (rxs->flag & (RX_FLAG_NO_SIGNAL_VAL | RX_FLAG_FAILED_FCS_CRC)) != 0)) {
         _rssi = rxs->signal;
+        _lastApRxMs = rtw88NowMs();
+        _probeNoAcks = 0;
+    }
 
     struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
     __le16 fc = hdr->frame_control;
@@ -1284,6 +1409,16 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
     __le16 fc = hdr->frame_control;
     uint16_t stype = le16_to_cpu(fc) & 0x00f0;
 
+    /* 802.11w: robust frames come protected once the keys are in. */
+    if ((stype == 0x00A0 || stype == 0x00C0 || stype == 0x00D0) && !mgmtFilterRx(skb)) {
+        kfree_skb(skb);
+        return;
+    }
+
+    if (stype == 0x0080 && _associatedVisible && skb->len > 36 &&
+        memcmp(((struct ieee80211_hdr_3addr *)skb->data)->addr3, _targetBSS.bssid, 6) == 0)
+        noteApBeacon(skb->data + 36, skb->len - 36);
+
     switch (stype) {
     case 0x0080: /* beacon */
     case 0x0050: /* probe response */
@@ -1299,7 +1434,10 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
         break;
 
     case 0x00B0: /* auth */
-        if (_state == RTW88_STATE_AUTHENTICATING && !authenticationCancelled()) {
+        if (_saeJoin && _state == RTW88_STATE_AUTHENTICATING && !authenticationCancelled() &&
+            rtw88ResponsePeer(skb->data, skb->len, _macAddr, _targetBSS.bssid)) {
+            saeQueueFrame(skb->data, skb->len);
+        } else if (_state == RTW88_STATE_AUTHENTICATING && !authenticationCancelled()) {
             uint16_t status = 0;
             if (rtw88AuthResponse(skb->data, skb->len, _macAddr, _targetBSS.bssid, &status)) {
                 if (status == 0) {
@@ -1307,9 +1445,7 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
                     doAssociate();
                 } else {
                     IOLog("rtw88: auth rejected by AP status=%u\n", status);
-                    _timer->cancelTimeout();
-                    _associatedVisible = false;
-                    _state = RTW88_STATE_IDLE;
+                    failJoin("auth-rejected");
                 }
             }
         }
@@ -1363,6 +1499,7 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
                 IOLog("rtw88: %s from AP, reason=%u — disconnecting\n",
                       (stype == 0x00C0) ? "deauth" : "disassoc", reason);
             }
+            const bool joining = _state == RTW88_STATE_HANDSHAKING;
             clearKeys();
             _txBaActive = false;
             rxBaTeardownAll();
@@ -1374,8 +1511,11 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
             /* IO80211/CoreWiFi needs the asynchronous deauth notification,
              * not only a link-state change.  The reference IO80211 driver forwards the same
              * net80211 event as APPLE80211_M_DEAUTH_RECEIVED. */
-            if (_delegate)
+            if (_delegate) {
                 _delegate->rtw88Event(kRTW88EventDeauth, &_deauthReason);
+                if (joining)
+                    _delegate->rtw88Event(kRTW88EventJoinFailed, nullptr);
+            }
         }
         kfree_skb(skb);
         break;
@@ -1410,6 +1550,8 @@ void RTW88IEEE80211::processRxMgmt(struct sk_buff *skb)
             const uint8_t *b = skb->data + sizeof(*h3);
             uint32_t blen = (skb->len > sizeof(*h3)) ?
                             skb->len - (uint32_t)sizeof(*h3) : 0;
+            if (memcmp(h3->addr3, _targetBSS.bssid, 6) == 0)
+                (void)handleSaQuery(b, blen);
             /* BlockAck (ADDBA/DELBA) action frames from our AP only. */
             if (blen >= 2 && b[0] == WLAN_CATEGORY_BACK &&
                 memcmp(h3->addr3, _targetBSS.bssid, 6) == 0)
@@ -1491,6 +1633,52 @@ static bool rtw88RsnSelectCcmpPsk(const uint8_t *rsn, uint8_t len,
         *pairwise_cipher = WLAN_CIPHER_SUITE_CCMP;
     if (group_cipher)
         *group_cipher = group;
+    return true;
+}
+
+/* What an RSN element offers, for choosing the key management at join time:
+ * every AKM suite as a bit, the capabilities and the group cipher.  True when
+ * it is well formed and pairwise CCMP (with a CCMP or TKIP group) is there.
+ * A required management cipher other than BIP-CMAC-128 makes it unusable. */
+static bool rtw88RsnParseInfo(const uint8_t *rsn, uint8_t len, uint32_t *akms,
+                              uint16_t *caps, uint32_t *group_out)
+{
+    const uint8_t *p = rsn, *end = rsn + len;
+    bool ccmp = false;
+    if (!rsn || len < 8 || p[0] != 1 || p[1] != 0) return false;
+    p += 2;
+    uint32_t group = rtw88ReadSuite(p);
+    p += 4;
+    uint16_t count = (uint16_t)(p[0] | (p[1] << 8));
+    p += 2;
+    if (count > (size_t)(end - p) / 4) return false;
+    for (; count; count--, p += 4)
+        ccmp |= rtw88ReadSuite(p) == WLAN_CIPHER_SUITE_CCMP;
+    if (end - p < 2) return false;
+    count = (uint16_t)(p[0] | (p[1] << 8));
+    p += 2;
+    if (count > (size_t)(end - p) / 4) return false;
+    uint32_t a = 0;
+    for (; count; count--, p += 4)
+        if (p[0] == 0x00 && p[1] == 0x0f && p[2] == 0xac && p[3] < 32)
+            a |= 1u << p[3];
+    uint16_t c = 0;
+    if (end - p >= 2) { c = (uint16_t)(p[0] | (p[1] << 8)); p += 2; }
+    if (end - p >= 2) {
+        count = (uint16_t)(p[0] | (p[1] << 8));
+        p += 2;
+        if (count > (size_t)(end - p) / 16) return false;
+        p += count * 16u;
+    }
+    if (end - p >= 4 && rtw88ReadSuite(p) != 0x000FAC06 && (c & 0x0080)) {
+        if (c & 0x0040) return false;
+        c &= (uint16_t)~0x0080;
+    }
+    if (!ccmp || (group != WLAN_CIPHER_SUITE_CCMP && group != WLAN_CIPHER_SUITE_TKIP))
+        return false;
+    *akms = a;
+    *caps = c;
+    *group_out = group;
     return true;
 }
 
@@ -1612,6 +1800,18 @@ void RTW88IEEE80211::processScanResult(struct sk_buff *skb)
                 bss->group_cipher = group;
                 bss->akm = 0x000FAC02; /* PSK */
             }
+            uint32_t akms = 0, rsnGroup = 0;
+            uint16_t rsnCaps = 0;
+            if (rtw88RsnParseInfo(body + 2, len, &akms, &rsnCaps, &rsnGroup)) {
+                bss->akms = akms;
+                bss->rsn_caps = rsnCaps;
+                /* WPA3-only and 802.1X networks offer no PSK. */
+                if (!bss->cipher && (akms & 0x142)) {
+                    bss->cipher = WLAN_CIPHER_SUITE_CCMP;
+                    bss->group_cipher = rsnGroup;
+                    bss->akm = 0x000FAC00u | ((akms & 0x100) ? 8u : (akms & 0x40) ? 6u : 1u);
+                }
+            }
         } else if (id == WLAN_EID_VENDOR_SPECIFIC &&
                    len >= 8 && body[2] == 0x00 && body[3] == 0x50 &&
                    body[4] == 0xf2 && body[5] == 0x01 &&
@@ -1643,6 +1843,7 @@ void RTW88IEEE80211::processScanResult(struct sk_buff *skb)
     bss->rssi = rxs->signal;
     bss->freq = rxs->freq;
     bss->last_seen_scan = _scanGeneration;
+    bss->last_seen_ms = rtw88NowMs();
     const bool ssidNamed = bss->ssid_len != 0;
     if (ssidNamed && (le16_to_cpu(hdr->frame_control) & 0x00f0) == 0x0080)
         bss->beacon_named = 1;
@@ -1671,6 +1872,8 @@ void RTW88IEEE80211::processScanResult(struct sk_buff *skb)
                 bss->cipher = e->cipher;
                 bss->group_cipher = e->group_cipher;
                 bss->akm = e->akm;
+                bss->akms = e->akms;
+                bss->rsn_caps = e->rsn_caps;
                 // Preserve the coherent security/capability IE set only when
                 // the new observation was incomplete, not after an open AP.
                 if (!iesComplete) {
@@ -1815,8 +2018,9 @@ void RTW88IEEE80211::deliverDataFrame(struct sk_buff *skb)
 
     /* Once the pairwise key is installed only EAPOL may arrive in the
      * clear (mac80211 ieee80211_drop_unencrypted). The EAPOL exception is
-     * applied below, after the LLC/SNAP header is parsed. */
-    bool keyed = _m3KeysInstalled || _externalPTKInstalled;
+     * applied below, after the LLC/SNAP header is parsed.  On 802.1X the link
+     * is up before the 4-way handshake: the same rule holds from the start. */
+    bool keyed = _m3KeysInstalled || _externalPTKInstalled || _enterprise;
 
     bool amsdu = false;
     if (ieee80211_is_data_qos(hdr->frame_control))
@@ -1892,10 +2096,13 @@ void RTW88IEEE80211::deliverDataFrame(struct sk_buff *skb)
         }
 
         /* Check for EAPOL during handshake (never aggregated). */
-        if (ethertype == ETH_P_PAE && !_externalSupplicant &&
+        /* 802.1X: only key frames are ours; EAP goes up to eapolclient. */
+        const bool eapForStack = _enterprise && ethertype == ETH_P_PAE &&
+            (skb->len < payload_off + 8 + 2 || llc[8 + 1] != 3);
+        if (ethertype == ETH_P_PAE && !_externalSupplicant && !eapForStack &&
             (_state == RTW88_STATE_HANDSHAKING || _state == RTW88_STATE_CONNECTED ||
              (_state == RTW88_STATE_SCANNING && _scanReturnState == RTW88_STATE_CONNECTED))) {
-            handleEAPOL(llc + 8, skb->len - payload_off - 8);
+            rxEapolKey(llc + 8, skb->len - payload_off - 8);
             kfree_skb(skb);
             return;
         }
@@ -2201,6 +2408,15 @@ void RTW88IEEE80211::txStatus(struct sk_buff *skb)
                 } else {
                     frameName = "data";
                 }
+            } else if ((fc & IEEE80211_FCTL_STYPE) == 0x0040) {
+                /* The link monitor's probe (a null frame). */
+                frameName = "probe";
+                if (info->flags & IEEE80211_TX_STAT_ACK) {
+                    _lastApRxMs = rtw88NowMs();
+                    _probeNoAcks = 0;
+                } else {
+                    _probeNoAcks++;
+                }
             }
         }
     }
@@ -2376,9 +2592,12 @@ void RTW88IEEE80211::scanDone(bool aborted)
             bool isTarget = (effectiveState == RTW88_STATE_CONNECTED ||
                              effectiveState == RTW88_STATE_HANDSHAKING) &&
                             memcmp(b->bssid, _targetBSS.bssid, 6) == 0;
-            uint32_t age = _scanGeneration - b->last_seen_scan;
+            /* Kept through a scan and aged by time: a connected scan only
+             * visits a slice of the channels.  90 s, or a full round of
+             * slices (5 x 30 s + margin) while connected. */
+            const uint64_t limit = effectiveState == RTW88_STATE_CONNECTED ? 240000 : 90000;
 
-            if (!isTarget && age > 3) {
+            if (!isTarget && rtw88NowMs() - b->last_seen_ms > limit) {
                 *link = b->next;
                 IOFree(b, sizeof(*b));
                 if (_bssCount)
@@ -2388,8 +2607,21 @@ void RTW88IEEE80211::scanDone(bool aborted)
 
             link = &b->next;
         }
+        /* Strongest first: the Wi-Fi menu lists networks in this order. */
+        RTW88BSS *sorted = nullptr;
+        while (_bssList) {
+            RTW88BSS *b = _bssList;
+            _bssList = b->next;
+            RTW88BSS **at = &sorted;
+            while (*at && (*at)->rssi >= b->rssi) at = &(*at)->next;
+            b->next = *at;
+            *at = b;
+        }
+        _bssList = sorted;
         IOLockUnlock(_bssLock);
     }
+
+    resetScanRequest();
 
     if (_state == RTW88_STATE_SCANNING) {
         RTW88State returnState = _scanReturnState;
@@ -2441,8 +2673,10 @@ void RTW88IEEE80211::scanDone(bool aborted)
         const bool pmkValid = _deferredPMKValid;
         const bool bssidValid = _deferredBSSIDValid;
         const bool externalSupplicant = _deferredExternalSupplicant;
+        const bool enterprise = _deferredEnterprise;
 
         _deferredConnectPending = false;
+        _deferredEnterprise = false;
         _deferredPMKValid = false;
         _deferredBSSIDValid = false;
         bzero(_deferredSSID, sizeof(_deferredSSID));
@@ -2453,7 +2687,7 @@ void RTW88IEEE80211::scanDone(bool aborted)
         IOReturn joinRet = cmdConnect(ssid, password[0] ? password : nullptr,
                                       pmkValid ? pmk : nullptr,
                                       bssidValid ? bssid : nullptr,
-                                      externalSupplicant);
+                                      externalSupplicant, enterprise);
         IOLog("rtw88: deferred ASSOCIATE after scan ret=0x%x ssid=%s\n",
               joinRet, ssid);
         bzero(pmk, sizeof(pmk));
@@ -2462,13 +2696,33 @@ void RTW88IEEE80211::scanDone(bool aborted)
     }
 }
 
+void RTW88IEEE80211::resetScanRequest()
+{
+    _scanSsidLen = 0;
+    _scanFilterCount = 0;
+    _scanWhileConnected = false;
+    _scanSlice = false;
+}
+
 IOReturn RTW88IEEE80211::cmdScan()
 {
+    IOReturn ret = startScan();
+    /* A scan that did not start leaves nothing for the next one; one already
+     * running keeps what it was asked for. */
+    if (ret != kIOReturnSuccess && _state != RTW88_STATE_SCANNING)
+        resetScanRequest();
+    return ret;
+}
+
+IOReturn RTW88IEEE80211::startScan()
+{
     _awdlPreparedChannel = 0;
-    /* Physical scans are only safe while unassociated until the manual
-     * scanner can honor CoreWiFi's requested channel subset / availability
-     * windows. RTL88WiFi handles CONNECTED background scans cache-only. */
-    if (_state != RTW88_STATE_IDLE) {
+    /* While connected only what cmdScanDirected() asked for: named channels or
+     * a network, or a short slice of the channels.  A full wildcard sweep
+     * stays off a live link. */
+    const bool connectedOk = _scanWhileConnected && _state == RTW88_STATE_CONNECTED &&
+                             _associatedVisible && !_awdlOffChannel;
+    if (_state != RTW88_STATE_IDLE && !connectedOk) {
         IOLog("rtw88: physical scan busy state=%u\n", (unsigned)_state);
         return kIOReturnBusy;
     }
@@ -2506,12 +2760,28 @@ IOReturn RTW88IEEE80211::cmdScan()
                 if (n_chans < 256) {
                     /* Only scan enabled channels */
                     if (!(band->channels[j].flags & IEEE80211_CHAN_DISABLED)) {
+                        bool wanted = _scanFilterCount == 0;
+                        for (uint32_t f = 0; f < _scanFilterCount && !wanted; f++)
+                            wanted = _scanFilter[f] == band->channels[j].hw_value;
+                        if (!wanted) continue;
                         band->channels[j].band = band->band;
                         chans[n_chans++] = &band->channels[j];
                     }
                 }
             }
         }
+    }
+
+    /* Connected and nothing in particular asked for: eight channels from
+     * where the last slice stopped, so the link is never away for long. */
+    if (_scanSlice && n_chans > 8) {
+        struct ieee80211_channel *slice[8];
+        for (int i = 0; i < 8; i++)
+            slice[i] = chans[(_scanSliceCursor + (uint32_t)i) % (uint32_t)n_chans];
+        _scanSliceCursor = (_scanSliceCursor + 8) % (uint32_t)n_chans;
+        for (int i = 0; i < 8; i++)
+            chans[i] = slice[i];
+        n_chans = 8;
     }
 
     if (n_chans == 0) {
@@ -2590,6 +2860,22 @@ IOReturn RTW88IEEE80211::cmdScan()
     return kIOReturnSuccess;
 }
 
+IOReturn RTW88IEEE80211::cmdScanDirected(const uint8_t *ssid, size_t ssidLen,
+                                         const uint8_t *channels, uint32_t nChannels, bool slice)
+{
+    if (_state == RTW88_STATE_SCANNING)
+        return kIOReturnBusy;
+    _scanSsidLen = (ssid && ssidLen <= sizeof(_scanSsid)) ? (uint8_t)ssidLen : 0;
+    if (_scanSsidLen)
+        memcpy(_scanSsid, ssid, _scanSsidLen);
+    _scanFilterCount = 0;
+    for (uint32_t i = 0; channels && i < nChannels && _scanFilterCount < sizeof(_scanFilter); i++)
+        _scanFilter[_scanFilterCount++] = channels[i];
+    _scanWhileConnected = true;
+    _scanSlice = slice;
+    return cmdScan();
+}
+
 void RTW88IEEE80211::manualScanTCFn(thread_call_param_t self, thread_call_param_t)
 {
     ((RTW88IEEE80211 *)self)->runManualScan();
@@ -2663,10 +2949,13 @@ void RTW88IEEE80211::runManualScan()
 /* ------------------------------------------------------------------ */
 
 bool RTW88IEEE80211::matchesPendingJoin(const char *ssid, const uint8_t *bssid,
-                                            const uint8_t *pmk) const
+                                            const uint8_t *pmk, const char *password) const
 {
+    if (ssid && strcmp(ssid, _targetBSS.ssid) == 0 && password &&
+        (!bssid || memcmp(bssid, _targetBSS.bssid, 6) == 0 || memcmp(bssid, _askedBSSID, 6) == 0))
+        return strncmp(password, _password, sizeof(_password)) == 0;
     return ssid && strcmp(ssid, _targetBSS.ssid) == 0 &&
-        (!bssid || memcmp(bssid, _targetBSS.bssid, 6) == 0) &&
+        (!bssid || memcmp(bssid, _targetBSS.bssid, 6) == 0 || memcmp(bssid, _askedBSSID, 6) == 0) &&
         (pmk != nullptr) == _pmkProvided &&
         (!pmk || memcmp(pmk, _pmk, sizeof(_pmk)) == 0);
 }
@@ -2680,14 +2969,36 @@ void RTW88IEEE80211::failJoin(const char *stage)
     if (_timer) _timer->cancelTimeout();
     _associatedVisible = false;
     _state = RTW88_STATE_IDLE;
+    /* setLinkStatus() waits for the command gate and cancelAuthentication()
+     * waits for this worker: report from the RX workloop instead. */
+    __atomic_store_n(&_joinFailPending, true, __ATOMIC_RELEASE);
+    if (_joinFailTimer) _joinFailTimer->setTimeoutMS(1);
+}
+
+void RTW88IEEE80211::joinFailTimerFired(OSObject *owner, IOTimerEventSource *)
+{
+    RTW88IEEE80211 *self = OSDynamicCast(RTW88IEEE80211, owner);
+    if (self) self->reportJoinFailure();
+}
+
+void RTW88IEEE80211::reportJoinFailure()
+{
+    /* Cleared by a newer join or a disconnect, which report for themselves. */
+    if (!__atomic_exchange_n(&_joinFailPending, false, __ATOMIC_ACQ_REL))
+        return;
     if (_parent) _parent->setLinkStatus(kIONetworkLinkValid);
-    if (_delegate) _delegate->rtw88Event(kRTW88EventDisconnected, nullptr);
+    if (_delegate) {
+        _delegate->rtw88Event(kRTW88EventJoinFailed, nullptr);
+        _delegate->rtw88Event(kRTW88EventDisconnected, nullptr);
+    }
 }
 
 IOReturn RTW88IEEE80211::cmdConnect(const char *ssid, const char *password, const uint8_t *pmk,
-                                      const uint8_t *bssid, bool externalSupplicant)
+                                      const uint8_t *bssid, bool externalSupplicant,
+                                      bool enterprise)
 {
     if (!ssid || !ssid[0] || strnlen(ssid, 33) > 32) return kIOReturnBadArgument;
+    __atomic_store_n(&_joinFailPending, false, __ATOMIC_RELEASE);
 
     /* The reference IO80211 driver accepts ASSOCIATE while net80211 is in SCAN.  Returning
      * EBUSY here made CoreWiFi abort the join and issue DISASSOCIATE while our
@@ -2704,6 +3015,7 @@ IOReturn RTW88IEEE80211::cmdConnect(const char *ssid, const char *password, cons
         if (bssid) memcpy(_deferredBSSID, bssid, sizeof(_deferredBSSID));
         else bzero(_deferredBSSID, sizeof(_deferredBSSID));
         _deferredExternalSupplicant = externalSupplicant;
+        _deferredEnterprise = enterprise;
         _deferredConnectPending = true;
 
         if (_manualScanChannelCount) {
@@ -2728,23 +3040,76 @@ IOReturn RTW88IEEE80211::cmdConnect(const char *ssid, const char *password, cons
     /* A new join supersedes any previous externally-visible RUN state. */
     _associatedVisible = false;
 
-    /* Find the SSID in our BSS list */
+    /* A leftover SAE exchange from an earlier attempt. */
+    if (_saeTC) thread_call_cancel_wait(_saeTC);
+    saeFlushQueue();
+    saeEnd();
+
+    /* Find the SSID in our BSS list: the access point macOS named, else the
+     * strongest of the network's. */
     IOLockLock(_bssLock);
-    RTW88BSS *target = nullptr;
+    RTW88BSS *target = nullptr, *best = nullptr;
     const size_t wantedLen = strnlen(ssid, sizeof(_targetBSS.ssid));
     for (RTW88BSS *b = _bssList; b; b = b->next) {
-        if (b->ssid_len == wantedLen &&
-            memcmp(b->ssid, ssid, wantedLen) == 0 &&
-            (!bssid || memcmp(b->bssid, bssid, 6) == 0)) {
+        if (b->ssid_len != wantedLen || memcmp(b->ssid, ssid, wantedLen) != 0)
+            continue;
+        if (bssid && memcmp(b->bssid, bssid, 6) == 0)
             target = b;
-            break;
+        if (!best || b->rssi > best->rssi)
+            best = b;
+    }
+    if (!target && best) {
+        target = best;
+        /* Nobody named an access point: the network's 5 GHz side when its
+         * signal is good, as Windows and wpa_supplicant choose (a 2.4 GHz
+         * link is 20 MHz wide).  When macOS names one it is not guessing:
+         * the other band of a "same" network may be another device. */
+        if (!bssid && target->channel <= 14) {
+            RTW88BSS *alt = nullptr;
+            for (RTW88BSS *b = _bssList; b; b = b->next) {
+                if (b->ssid_len != wantedLen || memcmp(b->ssid, ssid, wantedLen) != 0 ||
+                    b->channel <= 14 || b->rssi < -70 || b->rssi + 15 <= target->rssi)
+                    continue;
+                const bool sameKey = (!b->cipher && !target->cipher) ||
+                    (b->cipher && target->cipher && (b->akms & target->akms));
+                if (sameKey && (!alt || b->rssi > alt->rssi))
+                    alt = b;
+            }
+            if (alt) {
+                IOLog("rtw88: joining channel %u (%d dBm) rather than channel %u (%d dBm)\n",
+                      alt->channel, alt->rssi, target->channel, target->rssi);
+                target = alt;
+            }
         }
     }
     if (!target) {
         IOLockUnlock(_bssLock);
+        /* Not heard yet: a hidden network, or a phone's hotspot macOS has only
+         * just switched on.  One scan probing for it by name, then this join
+         * again from scanDone(). */
+        if (!_joinScanTried) {
+            _joinScanTried = true;
+            strlcpy(_deferredSSID, ssid, sizeof(_deferredSSID));
+            strlcpy(_deferredPassword, password ? password : "", sizeof(_deferredPassword));
+            _deferredPMKValid = pmk != nullptr;
+            if (pmk) memcpy(_deferredPMK, pmk, sizeof(_deferredPMK));
+            _deferredBSSIDValid = false;
+            _deferredExternalSupplicant = externalSupplicant;
+            _deferredEnterprise = enterprise;
+            _deferredConnectPending = true;
+            IOReturn scanRet = cmdScanDirected((const uint8_t *)ssid, wantedLen, nullptr, 0, false);
+            IOLog("rtw88: network not heard yet: scanning for it ret=0x%x\n", scanRet);
+            if (scanRet == kIOReturnSuccess)
+                return kIOReturnSuccess;
+            clearDeferredJoin();
+        }
         return kIOReturnNotFound;
     }
     memcpy(&_targetBSS, target, sizeof(_targetBSS));
+    if (bssid && memcmp(target->bssid, bssid, 6) != 0)
+        memcpy(_askedBSSID, bssid, 6);
+    else
+        bzero(_askedBSSID, 6);
     _curBssTim = false;
     _rssi = target->rssi < 0 && target->rssi >= -127 ? target->rssi : -100;
     IOLockUnlock(_bssLock);
@@ -2778,8 +3143,16 @@ IOReturn RTW88IEEE80211::cmdConnect(const char *ssid, const char *password, cons
                   _targetBSS.cipher, _targetBSS.akm, _assocRsnIELen);
             return kIOReturnUnsupported;
         }
-    } else if ((_targetBSS.capabilities & 0x10) && !pmk && !password) {
+    } else if ((_targetBSS.capabilities & 0x10) && !pmk && !password && !enterprise) {
         return kIOReturnUnsupported;
+    }
+
+    if (!externalSupplicant) {
+        IOReturn secRet = prepareJoinSecurity(password, pmk, enterprise, false);
+        if (secRet != kIOReturnSuccess)
+            return secRet;
+    } else {
+        resetJoinSecurity();
     }
 
     _authAttempts = 0;
@@ -2809,7 +3182,26 @@ void RTW88IEEE80211::doAuthenticate()
 {
     _awdlPreparedChannel = 0;
     if (authenticationCancelled() || !_powered || !_hw || !_vif) return;
-    if (++_authAttempts > 3) { failJoin("auth-retry-limit"); return; }
+    /* Retries and the fallback must not race the SAE worker, which owns _sae. */
+    IOLockLock(_saeOpLock);
+    /* A retry queued just before the exchange finished: nothing left to do. */
+    if (_saeJoin && _state != RTW88_STATE_AUTHENTICATING) {
+        IOLockUnlock(_saeOpLock);
+        return;
+    }
+    if (++_authAttempts > 3) {
+        if (!saeFallBack("no answer to SAE"))
+            failJoin("auth-retry-limit");
+        IOLockUnlock(_saeOpLock);
+        return;
+    }
+    /* SAE retry: the channel is set, only the message due goes out again. */
+    if (_saeJoin && _sae) {
+        saeBeginOrResend();
+        IOLockUnlock(_saeOpLock);
+        return;
+    }
+    IOLockUnlock(_saeOpLock);
 
     IOLog("rtw88: doAuthenticate entry — BSSID %02x:%02x:%02x:%02x:%02x:%02x ch=%u\n",
           _targetBSS.bssid[0], _targetBSS.bssid[1], _targetBSS.bssid[2],
@@ -2877,6 +3269,14 @@ void RTW88IEEE80211::doAuthenticate()
               _targetBSS.channel);
         rtw88_connect_hw_setup(_hw, _vif, _targetBSS.bssid);
         IOLog("rtw88: doAuthenticate: connect_hw_setup done\n");
+        /* TX power tables follow the access point's country, as on Linux. */
+        int cc = rtw88IeFind(_targetBSS.ies, _targetBSS.ies_len, 7);
+        if (cc >= 0 && _targetBSS.ies[cc + 1] >= 2 &&
+            _targetBSS.ies[cc + 2] >= 'A' && _targetBSS.ies[cc + 2] <= 'Z' &&
+            _targetBSS.ies[cc + 3] >= 'A' && _targetBSS.ies[cc + 3] <= 'Z') {
+            IOLog("rtw88: AP country %c%c\n", _targetBSS.ies[cc + 2], _targetBSS.ies[cc + 3]);
+            rtw88_regd_set_country(_hw, (const char *)&_targetBSS.ies[cc + 2]);
+        }
     } else {
         failJoin("channel-not-found");
         return;
@@ -2894,6 +3294,13 @@ void RTW88IEEE80211::doAuthenticate()
     _vif->cfg.assoc = false;
     _vif->cfg.aid = 0;
     _assocAID = 0;
+
+    if (_saeJoin) {
+        IOLockLock(_saeOpLock);
+        saeBeginOrResend();
+        IOLockUnlock(_saeOpLock);
+        return;
+    }
 
     /* ----- 2. Send Authentication frame ----- */
     IOLog("rtw88: doAuthenticate: building auth frame\n");
@@ -2915,8 +3322,9 @@ void RTW88IEEE80211::doAssociate()
 {
     if (!_hw || !_vif) return;
 
-    uint8_t assoc[256] = {};
+    uint8_t assoc[512] = {};
     uint32_t assoclen  = 0;
+    _assocRetryPending = false;
     if (authenticationCancelled()) return;
     if (!buildAssocReq(assoc, &assoclen)) { failJoin("assoc-build"); return; }
     // Publish the state before TX: a fast response may arrive during submission.
@@ -3079,10 +3487,18 @@ void RTW88IEEE80211::processAssocResponse(struct sk_buff *skb)
     kfree_skb(skb);
     if (!valid || authenticationCancelled()) return;
 
+    /* 802.11w: the AP still holds our old association and is checking on it
+     * (status 30): ask again in a moment. */
+    if (status == 30 && _mfp && _assocComebacks < 3) {
+        _assocComebacks++;
+        _assocRetryPending = true;
+        IOLog("rtw88: the AP asks to come back: retry %u\n", _assocComebacks);
+        uint64_t d; clock_interval_to_deadline(1000, kMillisecondScale, &d); _timer->wakeAtTime(d);
+        return;
+    }
     if (status != 0) {
         IOLog("rtw88: assoc failed status=%u\n", status);
-        _associatedVisible = false;
-        _state = RTW88_STATE_IDLE;
+        failJoin("assoc-rejected");
         return;
     }
     IOLog("rtw88: associated! AID=%u\n", aid);
@@ -3164,11 +3580,14 @@ void RTW88IEEE80211::processAssocResponse(struct sk_buff *skb)
             BSS_CHANGED_ASSOC | BSS_CHANGED_QOS);
     }
 
-    if (_wpa2 && !_externalSupplicant) {
+    startLinkMonitor();
+
+    if (_wpa2 && !_externalSupplicant && !_enterprise) {
         _state = RTW88_STATE_HANDSHAKING;
         IOLog("rtw88: WPA2 — waiting for EAPOL M1\n");
         /* Derive PMK from passphrase now */
-        if (!_pmkProvided) derivePMK((uint8_t *)_password, (uint8_t *)_targetBSS.ssid,
+        if (!_pmkProvided && !pmkFromHexPassword())
+            derivePMK((uint8_t *)_password, (uint8_t *)_targetBSS.ssid,
                   _targetBSS.ssid_len, _pmk);
         uint64_t d;
         clock_interval_to_deadline(8000, kMillisecondScale, &d);
@@ -3177,7 +3596,9 @@ void RTW88IEEE80211::processAssocResponse(struct sk_buff *skb)
         /* Apple RSN Supplicant needs the station in RUN so its EAPOL socket can
          * receive the AP's handshake frames.  The link becomes usable only after
          * CIPHER_KEY installs the PTK/GTK, but exposing RUN here mirrors
-         * the reference IO80211 driver's net80211 flow. */
+         * the reference IO80211 driver's net80211 flow.  802.1X likewise:
+         * macOS's eapolclient signs in over the link, then the 4-way handshake
+         * in handleEAPOL() opens the controlled port. */
         _state = RTW88_STATE_CONNECTED;
         /* Our Apple-RSN path injects EAPOL through the normal BSD Ethernet
          * interface, unlike the reference IO80211 driver's net80211 path.  The interface must
@@ -3368,8 +3789,14 @@ bool RTW88IEEE80211::buildAssocReq(uint8_t *buf, uint32_t *len)
             memcpy(body, _assocRsnIE, _assocRsnIELen);
             body += _assocRsnIELen;
         } else {
-            uint16_t rsn_len = rtw88BuildSelectedRsnIe(body, _targetBSS.group_cipher);
+            uint16_t rsn_len = _ownRsnLen;
+            if (rsn_len) memcpy(body, _ownRsnIE, rsn_len);
+            else rsn_len = rtw88BuildSelectedRsnIe(body, _targetBSS.group_cipher);
             body += rsn_len;
+            if (_ownRsnxeLen) {
+                memcpy(body, _ownRsnxe, _ownRsnxeLen);
+                body += _ownRsnxeLen;
+            }
         }
     }
 
@@ -3412,6 +3839,13 @@ IOReturn RTW88IEEE80211::copyTargetIEs(uint8_t *out, uint32_t capacity, uint32_t
 IOReturn RTW88IEEE80211::copyTargetRsnIE(uint8_t *out, uint16_t capacity, uint16_t *len) const
 {
     if (!out || !len) return kIOReturnBadArgument;
+    /* Ours, as sent: a handshake has to repeat it. */
+    if (_ownRsnLen) {
+        if (capacity < _ownRsnLen) return kIOReturnNoSpace;
+        memcpy(out, _ownRsnIE, _ownRsnLen);
+        *len = _ownRsnLen;
+        return kIOReturnSuccess;
+    }
     if (_assocRsnIELen >= 2) {
         if (capacity < _assocRsnIELen) return kIOReturnNoSpace;
         memcpy(out, _assocRsnIE, _assocRsnIELen);
@@ -3475,6 +3909,7 @@ void RTW88IEEE80211::clearDeferredJoin()
     _deferredPMKValid = false;
     _deferredBSSIDValid = false;
     _deferredExternalSupplicant = false;
+    _deferredEnterprise = false;
     bzero(_deferredSSID, sizeof(_deferredSSID));
     bzero(_deferredPassword, sizeof(_deferredPassword));
     bzero(_deferredPMK, sizeof(_deferredPMK));
@@ -3484,9 +3919,13 @@ void RTW88IEEE80211::clearDeferredJoin()
 void RTW88IEEE80211::cancelAuthentication()
 {
     __atomic_store_n(&_connectCancelled, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&_joinFailPending, false, __ATOMIC_RELEASE);
     if (_timer) _timer->cancelTimeout();
     // All authentication retries use this call, so draining it also drains retries.
     if (_connectTC) thread_call_cancel_wait(_connectTC);
+    if (_saeTC) thread_call_cancel_wait(_saeTC);
+    if (_saeLock) saeFlushQueue();
+    saeEnd();
 }
 
 IOReturn RTW88IEEE80211::cmdDisconnect()
@@ -3615,10 +4054,8 @@ void RTW88IEEE80211::doDisconnect()
         _scanReturnState = RTW88_STATE_IDLE;
         return;
     }
-    clearKeys();
-    clearAssocRsnIE();
-
-    /* Send deauth frame */
+    /* Under 802.11w the AP only believes a deauth protected with the keys. */
+    const bool deauthFirst = _mfp && _ptkConf;
     uint8_t deauth[28] = {};
     struct ieee80211_hdr_3addr *hdr = (struct ieee80211_hdr_3addr *)deauth;
     hdr->frame_control = cpu_to_le16(IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_DEAUTH);
@@ -3627,7 +4064,13 @@ void RTW88IEEE80211::doDisconnect()
     memcpy(hdr->addr3, _targetBSS.bssid, 6);
     uint8_t *body = deauth + sizeof(*hdr);
     body[0] = WLAN_REASON_DEAUTH_LEAVING; body[1] = 0;
-    txMgmtFrame(deauth, sizeof(*hdr) + 2);
+    if (deauthFirst)
+        txMgmtFrame(deauth, sizeof(*hdr) + 2);
+    clearKeys();
+    clearAssocRsnIE();
+    if (!deauthFirst)
+        txMgmtFrame(deauth, sizeof(*hdr) + 2);
+    resetJoinSecurity();
 
     /* Notify driver */
     struct ieee80211_bss_conf *bss = &_vif->bss_conf;
@@ -3668,7 +4111,7 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
         return;
 
     uint16_t key_info = (uint16_t)((data[5] << 8) | data[6]);
-    if (data[4] != 2 || (key_info & 7) != 2 || (key_info & 0x0c00)) {
+    if (data[4] != 2 || (key_info & 7) != _keyVer || (key_info & 0x0c00)) {
         IOLog("rtw88: unsupported EAPOL descriptor/flags ki=0x%04x\n", key_info);
         return;
     }
@@ -3685,8 +4128,9 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
     if (is_g1) {
         /* Only on an established pairwise association: the MIC and key-data
          * wrapping use the installed PTK, and message 2 is sent under it. */
-        if (_state != RTW88_STATE_CONNECTED || !_m3KeysInstalled ||
-            _handshakePending || !_ptkConf) {
+        if ((_state != RTW88_STATE_CONNECTED &&
+             !(_state == RTW88_STATE_SCANNING && _scanReturnState == RTW88_STATE_CONNECTED)) ||
+            !_m3KeysInstalled || _handshakePending || !_ptkConf) {
             IOLog("rtw88: group M1 dropped: no established PTK state=%d\n", (int)_state);
             return;
         }
@@ -3695,7 +4139,7 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
             IOLog("rtw88: stale group M1 dropped\n");
             return;
         }
-        if (!eapol_mic_ok(_ptk, data, eapol_len)) {
+        if (!eapol_mic_ok_for_version(_keyVer, _ptk, data, eapol_len)) {
             IOLog("rtw88: EAPOL group M1 MIC check failed\n");
             return;
         }
@@ -3758,17 +4202,22 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
         _snonceValid = true;
         _handshakePending = true;
         IOLog("rtw88: M1 fresh=%d rekey=%d\n", fresh, _m3KeysInstalled);
-        derivePTK(_pmk, _anonce, _snonce, _macAddr, _targetBSS.bssid, _ptk);
+        derivePTKForVersion(_keyVer, _pmk, _anonce, _snonce, _macAddr, _targetBSS.bssid, _ptk);
         memcpy(_replayCtr, data + 9, 8);
         if (!sendEAPOLKey(2, _replayCtr, false, false, true)) {
             IOLog("rtw88: M2 submission failed; waiting for AP retry\n");
         }
         // Rekey also needs a bounded timeout; retain existing data keys until
         // authenticated M3 installs new material.
-        _state = RTW88_STATE_HANDSHAKING;
-        uint64_t d;
-        clock_interval_to_deadline(5000, kMillisecondScale, &d);
-        _timer->wakeAtTime(d);
+        if (_state == RTW88_STATE_SCANNING) {
+            /* A connected scan owns the state and timer: end it, stay home. */
+            _manualScanAbort = true;
+        } else {
+            _state = RTW88_STATE_HANDSHAKING;
+            uint64_t d;
+            clock_interval_to_deadline(5000, kMillisecondScale, &d);
+            _timer->wakeAtTime(d);
+        }
     } else if (is_m3) {
         if (!_snonceValid || memcmp(data + 17, _anonce, 32) != 0 ||
             memcmp(data + 9, _replayCtr, 8) < 0 ||
@@ -3776,7 +4225,7 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
             IOLog("rtw88: M3 dropped: nonce/replay/handshake mismatch\n");
             return;
         }
-        if (!eapol_mic_ok(_ptk, data, eapol_len)) {
+        if (!eapol_mic_ok_for_version(_keyVer, _ptk, data, eapol_len)) {
             IOLog("rtw88: EAPOL M3 MIC check failed\n");
             return;
         }
@@ -3815,9 +4264,11 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
         }
 
         bool duplicate = _m3KeysInstalled && !_handshakePending;
-        if (duplicate && (!_ptkConf || memcmp(_ptkConf->key, _ptk + 32, 16) != 0 ||
-            (gtk_len && (!_gtkConf || _gtkConf->keyidx != gtk_idx ||
-             _gtkConf->keylen != gtk_len || memcmp(_gtkConf->key, gtk, gtk_len) != 0)))) {
+        const struct ieee80211_key_conf *ptkNow = __atomic_load_n(&_ptkConf, __ATOMIC_ACQUIRE);
+        const struct ieee80211_key_conf *gtkNow = __atomic_load_n(&_gtkConf, __ATOMIC_ACQUIRE);
+        if (duplicate && (!ptkNow || memcmp(ptkNow->key, _ptk + 32, 16) != 0 ||
+            (gtk_len && (!gtkNow || gtkNow->keyidx != gtk_idx ||
+             gtkNow->keylen != gtk_len || memcmp(gtkNow->key, gtk, gtk_len) != 0)))) {
             IOLog("rtw88: M3 retry changed key material without M1; rejected\n");
             return;
         }
@@ -3841,8 +4292,10 @@ void RTW88IEEE80211::handleEAPOL(const uint8_t *data, uint32_t len)
         }
         IOLog("rtw88: M4 submitted duplicate=%d; AP acceptance unverified\n", duplicate);
         _associatedVisible = true;
-        _state = RTW88_STATE_CONNECTED;
-        _timer->cancelTimeout();
+        if (_state != RTW88_STATE_SCANNING) {
+            _state = RTW88_STATE_CONNECTED;
+            _timer->cancelTimeout();
+        }
         if (_parent)
             _parent->setLinkStatus(kIONetworkLinkActive | kIONetworkLinkValid);
         if (!duplicate) startTxAggregation();   /* keys are installed — negotiate uplink A-MPDU */
@@ -3867,7 +4320,7 @@ bool RTW88IEEE80211::sendEAPOLKey(int step, const uint8_t *replay_counter,
     key[0] = 2;  /* key descriptor = RSN */
     /* version=2 (HMAC-SHA1/AES); step 5 is Group Key Handshake message 2,
      * which uses the group key type and carries no nonce or key data. */
-    uint16_t ki = (step == 5) ? 0x0002 : 0x000A;
+    uint16_t ki = (uint16_t)(((step == 5) ? 0x0000 : 0x0008) | _keyVer);
     if (mic)     ki |= 0x0100; /* MIC */
     if (install) ki |= 0x0040; /* Install */
     if (ack)     ki |= 0x0080; /* ACK */
@@ -3882,7 +4335,16 @@ bool RTW88IEEE80211::sendEAPOLKey(int step, const uint8_t *replay_counter,
 
     uint16_t key_data_len = 0;
     if (step == 2) {
-        key_data_len = rtw88BuildSelectedRsnIe(eapol + 99, _targetBSS.group_cipher);
+        if (_ownRsnLen) {
+            memcpy(eapol + 99, _ownRsnIE, _ownRsnLen);
+            key_data_len = _ownRsnLen;
+            if (_ownRsnxeLen) {
+                memcpy(eapol + 99 + key_data_len, _ownRsnxe, _ownRsnxeLen);
+                key_data_len = (uint16_t)(key_data_len + _ownRsnxeLen);
+            }
+        } else {
+            key_data_len = rtw88BuildSelectedRsnIe(eapol + 99, _targetBSS.group_cipher);
+        }
         if (99 + key_data_len > sizeof(frame) - 14)
             key_data_len = 0;
     }
@@ -3898,9 +4360,13 @@ bool RTW88IEEE80211::sendEAPOLKey(int step, const uint8_t *replay_counter,
     if (mic) {
         /* MIC = first 16 bytes of HMAC-SHA1(KCK, EAPOL frame with MIC zeroed)
          * KCK = _ptk[0..15]. */
-        uint8_t mic_buf[20];
-        kern_hmac_sha1(_ptk, 16, eapol, eapol_total, mic_buf);
-        memcpy(key + 77, mic_buf, 16);
+        if (_keyVer == 2) {
+            uint8_t mic_buf[20];
+            kern_hmac_sha1(_ptk, 16, eapol, eapol_total, mic_buf);
+            memcpy(key + 77, mic_buf, 16);
+        } else {
+            rtw88_aes_cmac(_ptk, eapol, eapol_total, key + 77);
+        }
     }
 
     uint32_t ethlen = 14 + eapol_total;
@@ -3937,7 +4403,7 @@ bool RTW88IEEE80211::txRawManagementFrame(const uint8_t *frame, uint32_t len)
     return txMgmtFrame(frame, len);
 }
 
-bool RTW88IEEE80211::txMgmtFrame(const uint8_t *frame, uint32_t len)
+bool RTW88IEEE80211::txMgmtFrameRaw(const uint8_t *frame, uint32_t len)
 {
     if (!_powered || !frame || len < 24 || len > 4096 ||
         !_hw || !_hw->ops || !_hw->ops->tx || !_vif) return false;
@@ -4005,6 +4471,7 @@ void RTW88IEEE80211::sendAddbaRequest(uint8_t tid)
     b[8] = (uint8_t)(ssc >> 8);
 
     _txBaPending = txMgmtFrame(f, sizeof(f));
+    _txBaSentMs = rtw88NowMs();
 }
 
 void RTW88IEEE80211::sendAddbaResponse(uint8_t tid, uint8_t dialog,
@@ -4056,6 +4523,7 @@ void RTW88IEEE80211::startTxAggregation()
     if (!htAllowed()) return;
     if (!_sta || !_sta->deflink.ht_cap.ht_supported) return;
     IOLog("rtw88: starting TX A-MPDU — sending ADDBA request (tid=%u)\n", _baTid);
+    _txBaRetries = 0;
     sendAddbaRequest(_baTid);
 }
 
@@ -4096,7 +4564,11 @@ void RTW88IEEE80211::handleBackAction(const uint8_t *b, uint32_t len)
         uint16_t status = (uint16_t)(b[3] | (b[4] << 8));
         uint16_t param  = (uint16_t)(b[5] | (b[6] << 8));
         uint8_t  tid    = (uint8_t)((param >> 2) & 0xf);
-        if (!_txBaPending || b[2] != _baDialog || tid != _baTid) break;
+        if (!_txBaPending || b[2] != _baDialog || tid != _baTid) {
+            IOLog("rtw88: TX ADDBA response ignored pending=%d dialog=%u/%u tid=%u/%u\n",
+                  _txBaPending, b[2], _baDialog, tid, _baTid);
+            break;
+        }
         _txBaPending = false;
         if (status == 0 && (param & (1u << 1))) {
             _txBaActive = true;
@@ -4128,7 +4600,7 @@ void RTW88IEEE80211::handleBackAction(const uint8_t *b, uint32_t len)
     }
 }
 
-bool RTW88IEEE80211::txNullFunc(bool powerSave)
+bool RTW88IEEE80211::txNullFunc(bool powerSave, bool wantStatus)
 {
     if (!_hw || !_hw->ops || !_hw->ops->tx || !_vif || !_sta)
         return false;
@@ -4157,6 +4629,8 @@ bool RTW88IEEE80211::txNullFunc(bool powerSave)
     struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
     memset(info, 0, sizeof(*info));
     info->flags = IEEE80211_TX_CTL_FIRST_FRAGMENT;
+    if (wantStatus)
+        info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
     info->band  = (_targetBSS.channel > 14) ? NL80211_BAND_5GHZ
                                             : NL80211_BAND_2GHZ;
     info->control.vif = _vif;
@@ -4183,9 +4657,12 @@ bool RTW88IEEE80211::txProbeRequest()
     hdr->seq_ctrl = cpu_to_le16((uint16_t)(_txSeq++ & 0xFFF) << 4);
 
     uint8_t *body = frame + sizeof(*hdr);
+    /* By name when a network was asked for: a hidden one answers only that. */
     body[0] = WLAN_EID_SSID;
-    body[1] = 0;
-    body += 2;
+    body[1] = _scanSsidLen;
+    if (_scanSsidLen)
+        memcpy(body + 2, _scanSsid, _scanSsidLen);
+    body += 2 + _scanSsidLen;
 
     static const uint8_t rates_2g[] = {
         0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24
@@ -4402,12 +4879,13 @@ bool RTW88IEEE80211::txDataFrame(mbuf_t m)
     if (mbuf_copydata(m, 0, 14, eh) != 0) { mbuf_freem(m); return false; }
     uint16_t ethertype = (uint16_t)((eh[12] << 8) | eh[13]);
 
+    struct ieee80211_key_conf *ptk = __atomic_load_n(&_ptkConf, __ATOMIC_ACQUIRE);
     if (ethertype == ETH_P_PAE) {
         IOLog("rtw88: EAPOL TX external=%d state=%d ptk=%p len=%u\n",
-              _externalSupplicant, _state, _ptkConf, paylen);
+              _externalSupplicant, _state, ptk, paylen);
     }
 
-    bool protected_frame = _wpa2 && _ptkConf &&
+    bool protected_frame = _wpa2 && ptk &&
         (ethertype != ETH_P_PAE || _eapolTxProtect);
 
     /* Use a QoS Data frame (24-byte header + 2-byte QoS Control) when HT is in
@@ -4449,20 +4927,18 @@ bool RTW88IEEE80211::txDataFrame(mbuf_t m)
     }
 
     if (protected_frame) {
-        for (int i = 0; i < 6; i++) {
-            if (++_ccmpTxPn[i] != 0)
-                break;
-        }
+        uint8_t pn[6];
+        nextCcmpPn(pn);   /* shared with protected management frames */
 
         uint8_t *ccmp = skb_put(skb, 8);
-        ccmp[0] = _ccmpTxPn[0];
-        ccmp[1] = _ccmpTxPn[1];
+        ccmp[0] = pn[0];
+        ccmp[1] = pn[1];
         ccmp[2] = 0x00;
-        ccmp[3] = (uint8_t)(0x20 | (((uint8_t)_ptkConf->keyidx & 0x3) << 6));
-        ccmp[4] = _ccmpTxPn[2];
-        ccmp[5] = _ccmpTxPn[3];
-        ccmp[6] = _ccmpTxPn[4];
-        ccmp[7] = _ccmpTxPn[5];
+        ccmp[3] = (uint8_t)(0x20 | (((uint8_t)ptk->keyidx & 0x3) << 6));
+        ccmp[4] = pn[2];
+        ccmp[5] = pn[3];
+        ccmp[6] = pn[4];
+        ccmp[7] = pn[5];
     }
 
     /* RFC 1042 LLC/SNAP header */
@@ -4506,7 +4982,7 @@ bool RTW88IEEE80211::txDataFrame(mbuf_t m)
     if (ethertype == ETH_P_PAE)
         info->flags |= IEEE80211_TX_CTL_REQ_TX_STATUS;
     if (protected_frame)
-        info->control.hw_key = _ptkConf;
+        info->control.hw_key = ptk;
 
     struct ieee80211_tx_control ctrl = { .sta = _sta };
     _hw->ops->tx(_hw, &ctrl, skb);
@@ -4608,12 +5084,14 @@ void RTW88IEEE80211::onTimer()
         break;
 
     case RTW88_STATE_ASSOCIATING:
+        if (_assocRetryPending) { doAssociate(); break; }
         failJoin("assoc-timeout");
         break;
 
     case RTW88_STATE_HANDSHAKING:
         IOLog("rtw88: 4-way handshake timeout\n");
         doDisconnect();
+        if (_delegate) _delegate->rtw88Event(kRTW88EventJoinFailed, nullptr);
         break;
 
     default:

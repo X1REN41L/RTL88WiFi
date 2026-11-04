@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.1.0 — 2026-11-04
+
+Features ported from AirPort_RTW89 that fit these chips. **None of this has
+been run on hardware, and this version has never been loaded.** It compiles and
+links, and the host tests pass. The kexts in `Kexts/` do not include it.
+Build identity `1.1.0-rtl88wifi-r13-20261104`.
+
+- **WPA3-Personal (SAE)**, hunting-and-pecking and hash-to-element, using
+  hostap's SAE code on Mbed TLS. Used only where a network requires it:
+  WPA2/WPA3 mixed networks stay on WPA2 unless `-rtl88saemixed` is set.
+- **Protected management frames (802.11w)** with SA Query. Group management
+  frames are not verified (no IGTK or BIP): a broadcast deauthentication is
+  ignored and the link monitor notices a lost AP instead.
+- **WPA2-Enterprise key handling.** macOS's `eapolclient` signs in; the driver
+  runs the 4-way handshake with the key it receives. Networks that require
+  protected management frames are refused on 802.1X.
+- **EAPOL key versions** 3 (PSK-SHA256) and 0 (AKM-defined, as SAE uses).
+- **Link monitor:** leaves the network when the AP stops answering, does not
+  answer an SA Query, or repeats a channel switch announcement and then goes
+  quiet on the channel. Beacons are not protected, so one announcement alone is
+  not believed.
+- **Joining and scanning:** joins the access point macOS names, and directed
+  scans for hidden networks. While connected every scan is at most eight
+  channels, at most every 30 s (every 10 s for one naming a network).
+- **Failed joins are reported:** macOS gets `ASSOC_DONE` when a join fails after
+  `ASSOCIATE` was accepted, as AirPort_RTW89 does, rather than waiting.
+- **Transmit power follows the AP's country.** The joined AP's country element
+  now selects the power tables, as on Linux. This also changes WPA2 and open
+  joins.
+- **macOS interface:** the passphrase, SAE and 802.1X forms of association
+  requests, and the SHA256-PSK auth values (not yet seen from macOS). A
+  passphrase under 8 characters is accepted for SAE only. WPA3 capability bits are advertised on Sequoia and newer only, which
+  also makes macOS send passphrases for WPA2 joins.
+- **Boot-args** to turn things off: `-rtl88nowpa3`, `-rtl88nobgscan`,
+  `-rtl88noawdl`. `-rtl88saemixed` uses SAE on mixed networks.
+
+Compatibility layer fixes: EWMA negative shift, `le64_get_bits`,
+`pcie_capability_*` (the RTL8821CE DEVCTL2 write now lands), firmware
+decompression treating `Z_OK` as failure, `skb_copy`, skb overflow traps and
+timer tracking.
+
+Reported running well on macOS Sequoia 15.8.2 with **1.0.1** on RTL8821CE: 88.8
+Mbps down, 95.0 Mbps up in one `networkQuality` run on channel 36, no router
+ping loss. That result is for 1.0.1, not this version.
+
 ## 1.0.1 — 2026-10-14
 
 Final maintenance release. It only corrects what macOS shows in System

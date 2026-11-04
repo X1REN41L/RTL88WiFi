@@ -50,6 +50,7 @@ static void IOFree(void*p,size_t){live--;free(p);}
 static void kfree_skb(sk_buff*b){if(!b)return;free(b->data);delete b;}
 static ieee80211_rx_status*IEEE80211_SKB_RXCB(sk_buff*b){return &b->rx;}
 static uint16_t le16_to_cpu(uint16_t v){return v;}
+static uint64_t rtw88NowMs(){return 1;}
 '''+bss_struct+r'''
 class RTW88IEEE80211{
 public:
@@ -150,7 +151,7 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-scanssid-') as td:
     p=Path(td)
-    src=prefix+fn('static uint32_t rtw88ReadSuite(')+'\n'+fn('static bool rtw88RsnSelectCcmpPsk(')+'\n'+fn('static bool rtw88SsidIsBlank(')+'\n'+fn('static int rtw88IeFind(')+'\n'+fn('static void rtw88RestoreSsidIe(')+'\n'+fn('void RTW88IEEE80211::processScanResult(')+main
+    src=prefix+fn('static uint32_t rtw88ReadSuite(')+'\n'+fn('static bool rtw88RsnSelectCcmpPsk(')+'\n'+fn('static bool rtw88RsnParseInfo(')+'\n'+fn('static bool rtw88SsidIsBlank(')+'\n'+fn('static int rtw88IeFind(')+'\n'+fn('static void rtw88RestoreSsidIe(')+'\n'+fn('void RTW88IEEE80211::processScanResult(')+main
     (p/'test.cpp').write_text(src)
     subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=all','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
     r=subprocess.run([str(p/'test')],capture_output=True,text=True)

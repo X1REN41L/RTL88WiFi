@@ -1,4 +1,4 @@
-/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * RTW88IEEE80211.hpp — 802.11 state machine for rtw88 macOS port.
  *
@@ -18,6 +18,7 @@
 #include <sys/mbuf.h>
 #include <net/ethernet.h>
 #include <kern/thread_call.h>
+#include <kern/clock.h>
 
 /* Opaque C driver handle */
 struct rtw_dev;
@@ -35,6 +36,7 @@ enum RTW88Event {
     kRTW88EventAssocDone,
     kRTW88EventDeauth,
     kRTW88EventDisconnected,
+    kRTW88EventJoinFailed,
     kRTW88EventRSSIChanged,
 };
 
@@ -127,6 +129,9 @@ struct RTW88BSS {
     uint32_t group_cipher; /* selected group WLAN_CIPHER_SUITE_* */
     uint32_t akm;
     uint32_t last_seen_scan;
+    uint64_t last_seen_ms;  /* uptime of the last frame heard */
+    uint32_t akms;          /* AKM suites offered (bit = 00-0f-ac:N) */
+    uint16_t rsn_caps;      /* RSN capabilities */
     /* Final: a beacon from this BSSID carried a non-empty, non-zero SSID, so
      * the AP is not hidden even if a later frame has a blank SSID element. */
     uint8_t  beacon_named;
@@ -135,6 +140,21 @@ struct RTW88BSS {
     uint16_t ies_len;
     RTW88BSS *next;
 };
+
+enum { kAkm8021X = 1, kAkmPsk = 2, kAkmPskSha256 = 6, kAkmSae = 8 };
+
+/* -rtl88nowpa3 turns WPA3 off: see RTW88Security.cpp. */
+bool rtw88Wpa3Enabled();
+
+static inline uint64_t rtw88NowMs()
+{
+    uint64_t abs = 0, ns = 0;
+    clock_get_uptime(&abs);
+    absolutetime_to_nanoseconds(abs, &ns);
+    return ns / 1000000ULL;
+}
+
+struct rtw88_sae;
 
 /* BSS operating width advertised by the HT Operation (61) and VHT
  * Operation (192) IEs.  Shared by the connection chandef and scan results. */
@@ -206,15 +226,28 @@ public:
     RTW88State rawState() const { return _state; }
     bool associatedVisible() const { return _associatedVisible; }
     IOReturn  cmdScan();
+    IOReturn  startScan();
+    void      resetScanRequest();
+    /* A scan that names a network and/or channels, or one slice of the
+     * channel list while connected (@slice). */
+    IOReturn  cmdScanDirected(const uint8_t *ssid, size_t ssidLen,
+                              const uint8_t *channels, uint32_t nChannels, bool slice);
+    /* A new join request from macOS: it may scan once for an unheard network. */
+    void      beginJoinRequest() { _joinScanTried = false; }
     IOReturn  cmdConnect(const char *ssid, const char *password, const uint8_t *pmk = nullptr,
-                         const uint8_t *bssid = nullptr, bool externalSupplicant = false);
+                         const uint8_t *bssid = nullptr, bool externalSupplicant = false,
+                         bool enterprise = false);
+    IOReturn  cmdSetEnterprisePMK(const uint8_t *pmk, size_t len);
     IOReturn  cmdInstallExternalKey(bool pairwise, uint8_t keyidx, uint32_t cipher,
                                     const uint8_t *key, uint8_t key_len);
     bool      externalKeysReady() const { return _externalPTKInstalled && _externalGTKInstalled; }
     IOReturn  cmdSetAssocRsnIE(const uint8_t *ie, uint16_t len);
     void      clearAssocRsnIE();
-    bool      matchesPendingJoin(const char *ssid, const uint8_t *bssid, const uint8_t *pmk) const;
+    bool      matchesPendingJoin(const char *ssid, const uint8_t *bssid, const uint8_t *pmk,
+                                 const char *password = nullptr) const;
     void      failJoin(const char *stage);
+    void      reportJoinFailure();
+    static void joinFailTimerFired(OSObject *owner, IOTimerEventSource *t);
     IOReturn  copyTargetIEs(uint8_t *out, uint32_t capacity, uint32_t *len) const;
     IOReturn  copyTargetRsnIE(uint8_t *out, uint16_t capacity, uint16_t *len) const;
     IOReturn copyScanBSS(uint32_t index, RTW88BSS *out);
@@ -259,6 +292,9 @@ private:
     void      doHandshake(const uint8_t *eapol, uint32_t len);
     void      doDisconnect();
     void      clearKeys();
+    void      retireKey(struct ieee80211_key_conf **slot, struct ieee80211_key_conf **retired,
+                        struct ieee80211_sta *sta);
+    void      freeRetiredKey(struct ieee80211_key_conf **retired);
     void      releaseSta();
     bool      abortActiveScan(bool waitForIdle);
     void      restoreConnectedChannel();
@@ -271,6 +307,40 @@ private:
 
     /* WPA2 4-way handshake */
     void      handleEAPOL(const uint8_t *data, uint32_t len);
+    void      rxEapolKey(const uint8_t *data, uint32_t len);
+    static void heldM1TimerFired(OSObject *owner, IOTimerEventSource *t);
+
+    /* WPA3 / 802.11w / link monitor: RTW88Security.cpp */
+    void      resetJoinSecurity();
+    IOReturn  prepareJoinSecurity(const char *password, const uint8_t *pmk,
+                                  bool enterprise, bool forcePsk);
+    bool      pmkFromHexPassword();
+    bool      saeStart(bool h2e);
+    void      saeEnd();
+    bool      saeSendAuth();
+    void      saeArmTimer();
+    bool      saeFallBack(const char *why);
+    void      saeRxFrame(const uint8_t *f, uint32_t len);
+    void      saeQueueFrame(const uint8_t *f, uint32_t len);
+    void      saeFlushQueue();
+    void      saeBeginOrResend();
+    static void saeTCFn(thread_call_param_t self, thread_call_param_t);
+    bool      mgmtUnprotect(struct sk_buff *skb);
+    bool      mgmtFilterRx(struct sk_buff *skb);
+    void      sendSaQuery(uint8_t action, const uint8_t id[2]);
+    bool      handleSaQuery(const uint8_t *body, uint32_t len);
+    void      noteApBeacon(const uint8_t *ies, uint32_t len);
+    void      startLinkMonitor();
+    void      linkLost(uint16_t reason, const char *why);
+    void      monitorTick();
+    static void monitorTimerFired(OSObject *owner, IOTimerEventSource *t);
+    void      nextCcmpPn(uint8_t pn[6]) {
+        while (__atomic_test_and_set(&_pnBusy, __ATOMIC_ACQUIRE)) {}
+        for (int i = 0; i < 6; i++)
+            if (++_ccmpTxPn[i] != 0) break;
+        memcpy(pn, _ccmpTxPn, 6);
+        __atomic_clear(&_pnBusy, __ATOMIC_RELEASE);
+    }
     bool      deriveKeys(const uint8_t *anonce, const uint8_t *snonce);
     bool      sendEAPOLKey(int step, const uint8_t *replay_counter,
                             bool install, bool ack, bool mic);
@@ -299,8 +369,9 @@ private:
     static void reorderTimerFired(OSObject *owner, IOTimerEventSource *t);
 
     /* Frame transmission helpers */
-    bool      txMgmtFrame(const uint8_t *frame, uint32_t len);
-    bool      txNullFunc(bool powerSave);
+    bool      txMgmtFrame(const uint8_t *frame, uint32_t len);   /* protects under 802.11w */
+    bool      txMgmtFrameRaw(const uint8_t *frame, uint32_t len);
+    bool      txNullFunc(bool powerSave, bool wantStatus = false);
     bool      txProbeRequest();
     bool      txDataFrame(mbuf_t m);
     bool      tryDeliverAWDLDataFrame(struct sk_buff *skb);
@@ -390,7 +461,20 @@ private:
      * soon as scanDone() returns the backend to IDLE. */
     bool                _deferredConnectPending = false;
     char                _deferredSSID[33] = {};
-    char                _deferredPassword[64] = {};
+    char                _deferredPassword[65] = {};
+    bool                _deferredEnterprise = false;
+    bool                _joinScanTried = false;
+    /* What the running scan is for: a network to probe by name, channels to
+     * visit (none: all), and where the next connected slice starts. */
+    uint8_t             _scanSsid[32] = {};
+    uint8_t             _scanSsidLen = 0;
+    uint8_t             _scanFilter[64] = {};
+    uint32_t            _scanFilterCount = 0;
+    bool                _scanWhileConnected = false;
+    bool                _scanSlice = false;
+    uint32_t            _scanSliceCursor = 0;
+    /* macOS named an access point but another of the network's was joined. */
+    uint8_t             _askedBSSID[6] = {};
     uint8_t             _deferredPMK[32] = {};
     bool                _deferredPMKValid = false;
     uint8_t             _deferredBSSID[6] = {};
@@ -399,7 +483,7 @@ private:
 
     /* Target BSS for connection */
     RTW88BSS            _targetBSS    = {};
-    char                _password[64] = {};
+    char                _password[65] = {};
     uint8_t             _authAttempts = 0;
 
     /* WPA2 key material */
@@ -408,6 +492,8 @@ private:
     uint8_t  _gtk[32]  = {};
     struct ieee80211_key_conf *_ptkConf = nullptr;
     struct ieee80211_key_conf *_gtkConf = nullptr;
+    struct ieee80211_key_conf *_retiredPtk = nullptr;
+    struct ieee80211_key_conf *_retiredGtk = nullptr;
     uint8_t  _anonce[32] = {};
     uint8_t  _snonce[32] = {};
     uint8_t  _replayCtr[8] = {};
@@ -430,6 +516,50 @@ private:
     bool     _wpa2     = false;
     uint8_t  _assocRsnIE[257] = {};
     uint16_t _assocRsnIELen = 0;
+    /* This join's key management (RTW88Security.cpp). */
+    bool     _mfp = false;             /* 802.11w negotiated */
+    uint8_t  _keyVer = 2;              /* EAPOL-Key version: 2 SHA1, 3 CMAC, 0 by AKM */
+    bool     _enterprise = false;      /* macOS's eapolclient signs in */
+    bool     _saeJoin = false;
+    bool     _saeFallbackAllowed = false;
+    uint8_t  _ownRsnIE[32] = {};       /* as sent; message 2 repeats it */
+    uint8_t  _ownRsnLen = 0;
+    uint8_t  _ownRsnxe[3] = {};
+    uint8_t  _ownRsnxeLen = 0;
+    volatile bool _pnBusy = false;
+    struct rtw88_sae *_sae = nullptr;
+    bool     _saeH2e = false;
+    bool     _saeConfirmSent = false;
+    uint8_t  _saeToken[128] = {};
+    uint8_t  _saeTokenLen = 0;
+    static const uint32_t kSaeFrameMax = 1024;
+    struct SaeFrame { SaeFrame *next; uint32_t len; uint8_t data[kSaeFrameMax]; };
+    SaeFrame *_saeQueue = nullptr;
+    IOLock   *_saeLock = nullptr;
+    IOLock   *_saeOpLock = nullptr;    /* serializes the worker and auth retries on _sae */
+    thread_call_t _saeTC = nullptr;
+    uint8_t  _assocComebacks = 0;
+    bool     _assocRetryPending = false;
+    uint64_t _mgmtRxPn = 0;
+    bool     _mgmtRxPnValid = false;
+    bool     _saQueryPending = false;
+    uint16_t _saQueryReason = 0;
+    uint8_t  _saQueryId[2] = {};
+    uint64_t _saQueryStartMs = 0;
+    uint8_t  _heldM1[512] = {};
+    uint16_t _heldM1Len = 0;
+    IOTimerEventSource *_heldM1Timer = nullptr;
+    IOTimerEventSource *_monitorTimer = nullptr;
+    IOTimerEventSource *_joinFailTimer = nullptr;
+    volatile bool _joinFailPending = false;
+    volatile uint64_t _lastApRxMs = 0;
+    uint64_t _lastProbeMs = 0;
+    volatile uint32_t _probeNoAcks = 0;
+    static const uint8_t kCsaMinBeacons = 2, kCsaQuietTicks = 3;
+    volatile uint8_t _csaChannel = 0;
+    volatile uint8_t _csaBeacons = 0;
+    uint8_t  _csaQuietTicks = 0;
+    bool     _csaLogged = false;
 
     /* Sequence number for TX frames */
     uint16_t _txSeq    = 0;
@@ -444,6 +574,9 @@ private:
     uint8_t  _connChanWidth = 20;  /* negotiated operating width: 20/40/80 MHz */
     uint8_t  _baDialog   = 0;      /* rolling ADDBA-request dialog token       */
     bool     _txBaPending = false;
+    uint64_t _txBaSentMs = 0;      /* when the last ADDBA request went out     */
+    uint8_t  _txBaRetries = 0;     /* resends of it in this negotiation        */
+    static const uint8_t kTxBaMaxRetries = 5;
     uint16_t _baBufSize  = 64;     /* advertised BlockAck buffer/window size   */
 
     /* RX A-MPDU reorder buffer — one per TID with an active downlink BA.

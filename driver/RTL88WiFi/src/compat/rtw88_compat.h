@@ -1,4 +1,4 @@
-/* Modified by X1REN41L on 2026-10-14 for RTL88WiFi 1.0.1; see the repository NOTICE.md. */
+/* Modified by X1REN41L on 2026-11-04 for RTL88WiFi 1.1.0; see the repository NOTICE.md. */
 /* SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
  * Master compatibility header for rtw88 macOS port.
  * Every driver .c file that includes linux/ or net/ headers ends up here
@@ -209,6 +209,7 @@ struct ieee80211_vif;
 /* Returns true while the driver's RTW_FLAG_SCANNING bit is set.
  * Used by the kext to wait for post-scan MMIO cleanup before connecting. */
 bool rtw88_is_scanning(void);
+void rtw88_regd_set_country(struct ieee80211_hw *hw, const char *alpha2);
 bool rtw88_hw_scan_supported(struct ieee80211_hw *hw);
 void rtw88_sw_scan_start(struct ieee80211_hw *hw, struct ieee80211_vif *vif);
 void rtw88_sw_scan_switch_channel(struct ieee80211_hw *hw);

@@ -10,6 +10,9 @@ RTL88WiFi is a derived work of GPL-2.0 licensed source:
 
 - the AirPort_RTW88 native IO80211 driver (source release of 2026-09, GPLv2);
 - the rtw88 macOS port it was built on;
+- AirPort_RTW89 (https://github.com/FranciumOS-org/AirPort_RTW89, GPL-2.0, commit
+  `a8441a7`), the source of the WPA3, protected management frame, 802.1X key
+  handling and link monitor flows and of `driver/RTL88WiFi/src/compat/wpa3/`;
 - the Linux kernel `rtw88` driver, dual licensed GPL-2.0 OR BSD-3-Clause
   (`driver/rtw88-stable/COPYING`).
 
@@ -19,6 +22,9 @@ the date; the full change history is in the Git log and `CHANGELOG.md`.
 
 ## Separately licensed parts
 
+- hostap's SAE code in `driver/third_party/hostap/` is BSD-3-Clause (`COPYING`).
+- Mbed TLS in `driver/third_party/mbedtls/` is Apache-2.0 OR GPL-2.0-or-later
+  (`LICENSE`); it is used here under GPL-2.0.
 - Kernel SDK headers in `driver/RTL88WiFi/MacKernelSDK/` keep their own
   notices and `LICENSE.txt`.
 - Realtek firmware in `driver/RTL88WiFi/firmware/` keeps its original notices

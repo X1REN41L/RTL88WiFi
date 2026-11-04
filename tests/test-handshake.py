@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess, tempfile
 
 root=Path(__file__).resolve().parents[1]/'driver/RTL88WiFi'
+wpa3=root/'src/compat/wpa3'
 s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()
 def fn(signature):
     start=s.index(signature);i=s.index('{',start)+1;depth=1
@@ -22,6 +23,7 @@ prefix=r'''
 #include <cassert>
 #include <vector>
 #include <algorithm>
+#include "rtw88_crypto.h"
 #define IOLog(...) ((void)0)
 #define WLAN_CIPHER_SUITE_CCMP 0x000fac04
 #define WLAN_CIPHER_SUITE_TKIP 0x000fac02
@@ -32,6 +34,7 @@ prefix=r'''
 #define kIONetworkLinkValid 2
 #define SET_KEY 1
 #define DISABLE_KEY 0
+#define RTW88_STATE_SCANNING 1
 #define RTW88_STATE_HANDSHAKING 4
 #define RTW88_STATE_CONNECTED 5
 using s8=int8_t;
@@ -54,24 +57,27 @@ struct Timer{void wakeAtTime(uint64_t){} void cancelTimeout(){}};
 struct Parent{void setLinkStatus(unsigned){}};
 class RTW88IEEE80211{
 public:
- HW*_hw;void*_vif=nullptr,*_sta=nullptr;Timer*_timer;Parent*_parent;
+ HW*_hw;void*_vif=nullptr;struct ieee80211_sta*_sta=nullptr;Timer*_timer;Parent*_parent;
  uint8_t _pmk[32]={1},_ptk[64]={},_gtk[32]={},_anonce[32]={},_snonce[32]={},_replayCtr[8]={},_installedM3ReplayCtr[8]={},_ccmpTxPn[6]={},_macAddr[6]={1,2,3,4,5,6};
- ieee80211_key_conf *_ptkConf=nullptr,*_gtkConf=nullptr;
+ ieee80211_key_conf *_ptkConf=nullptr,*_gtkConf=nullptr,*_retiredPtk=nullptr,*_retiredGtk=nullptr;bool _powered=true;
  bool _snonceValid=false,_m3KeysInstalled=false,_handshakePending=false,_associatedVisible=false,_eapolTxProtect=false;
  unsigned _state=RTW88_STATE_HANDSHAKING;
+ unsigned _scanReturnState=0;bool _manualScanAbort=false;uint8_t _keyVer=2,_ownRsnIE[32]={},_ownRsnLen=0,_ownRsnxe[3]={},_ownRsnxeLen=0;
+ bool _mgmtRxPnValid=false;uint64_t _mgmtRxPn=0;
  bool submitOK=true;int submissions=0,aggregationStarts=0;
  struct {uint8_t bssid[6]={7,8,9,10,11,12};uint32_t group_cipher=WLAN_CIPHER_SUITE_CCMP;} _targetBSS;
  bool installKey(ieee80211_key_conf**,bool,uint8_t,uint32_t,const uint8_t*,uint8_t);
+ void retireKey(ieee80211_key_conf**,ieee80211_key_conf**,struct ieee80211_sta*);
  void handleEAPOL(const uint8_t*,uint32_t);
  bool sendEAPOLKey(int,const uint8_t*,bool,bool,bool);
  bool txDataFrame(mbuf_t m){captured=*m;delete m;submissions++;return submitOK;}
  void startTxAggregation(){aggregationStarts++;}
- ~RTW88IEEE80211(){free(_ptkConf);free(_gtkConf);}
+ ~RTW88IEEE80211(){free(_ptkConf);free(_gtkConf);free(_retiredPtk);free(_retiredGtk);}
 };
 '''
 # Real crypto implementation, including MIC verification and GTK parsing.
 crypto=s[s.index('typedef struct {'):s.index('/* PCI device-ID')]
-wire='\n'.join(fn(x) for x in ('static void rtw88WriteSuite(', 'static uint16_t rtw88BuildSelectedRsnIe(', 'static const char *rtw88CipherName(', 'bool RTW88IEEE80211::installKey(', 'bool RTW88IEEE80211::sendEAPOLKey(', 'void RTW88IEEE80211::handleEAPOL('))
+wire='\n'.join(fn(x) for x in ('static void rtw88WriteSuite(', 'static uint16_t rtw88BuildSelectedRsnIe(', 'static const char *rtw88CipherName(', 'void RTW88IEEE80211::retireKey(', 'bool RTW88IEEE80211::installKey(', 'bool RTW88IEEE80211::sendEAPOLKey(', 'void RTW88IEEE80211::handleEAPOL('))
 main=r'''
 static std::vector<uint8_t> message(RTW88IEEE80211&c,uint16_t ki,uint8_t ctr,const uint8_t*nonce,bool sign){
  std::vector<uint8_t> p(99,0);p[0]=2;p[1]=3;p[3]=95;p[4]=2;p[5]=ki>>8;p[6]=ki;p[16]=ctr;memcpy(p.data()+17,nonce,32);
@@ -116,10 +122,47 @@ int main(){
  for(size_t len=0;len<freshM3.size();len++)c.handleEAPOL(freshM3.data(),len);
  uint32_t seed=1;uint8_t fuzz[400];for(unsigned t=0;t<10000;t++){for(auto&x:fuzz){seed=seed*1664525+1013904223;x=seed>>24;}c.handleEAPOL(fuzz,t%400);}
  c.handleEAPOL(nullptr,0);
- puts("PASS: HMAC/AES vectors; actual M1/M3 retries, replay/MIC rejection, PN preservation, submission failure, serialization and malformed inputs");
+ // AKM-defined keys (version 0, SAE) and version 3 (PSK-SHA256): KDF PTK, AES-CMAC MICs, own RSN/RSNXE in M2.
+ for(uint8_t ver:{(uint8_t)0,(uint8_t)3}){
+  RTW88IEEE80211 a;a._hw=&hw;a._timer=&timer;a._parent=&parent;a._keyVer=ver;
+  const uint8_t rsn[]={48,4,1,0,0xaa,0xbb},rsnxe[]={244,1,0x20};
+  memcpy(a._ownRsnIE,rsn,sizeof rsn);a._ownRsnLen=sizeof rsn;memcpy(a._ownRsnxe,rsnxe,sizeof rsnxe);a._ownRsnxeLen=sizeof rsnxe;
+  uint8_t an[32];memset(an,0xf0,32);
+  auto build=[&](uint16_t ki,uint8_t ctr,const uint8_t*wrapped,uint16_t wl,bool hmacMic){
+   std::vector<uint8_t> p(99+wl,0);uint16_t body=(uint16_t)(95+wl);p[0]=2;p[1]=3;p[2]=body>>8;p[3]=body;p[4]=2;p[5]=ki>>8;p[6]=ki;p[16]=ctr;memcpy(p.data()+17,an,32);
+   p[97]=wl>>8;p[98]=wl;if(wl)memcpy(p.data()+99,wrapped,wl);
+   if(ki&0x0100){uint8_t m[20];if(hmacMic)kern_hmac_sha1(a._ptk,16,p.data(),p.size(),m);else rtw88_aes_cmac(a._ptk,p.data(),p.size(),m);memcpy(p.data()+81,m,16);}
+   return p;};
+  auto v2=message(a,0x008a,1,an,false);int s0=a.submissions;a.handleEAPOL(v2.data(),v2.size());assert(a.submissions==s0); // wrong version refused
+  auto am1=build(0x0088|ver,1,nullptr,0,false);a.handleEAPOL(am1.data(),am1.size());assert(a.submissions==1);
+  // PTK = KDF-SHA256(PMK, label, min(AA,SPA)||max(AA,SPA)||min(nonces)||max(nonces)), 48 bytes, per 12.7.1.6.2.
+  uint8_t ctx[76];const uint8_t*aa=a._targetBSS.bssid,*sp=a._macAddr;memcpy(ctx,sp,6);memcpy(ctx+6,aa,6);
+  const bool anLow=memcmp(an,a._snonce,32)<0;memcpy(ctx+12,anLow?an:a._snonce,32);memcpy(ctx+44,anLow?a._snonce:an,32);
+  uint8_t want[48];rtw88_kdf_sha256(a._pmk,32,"Pairwise key expansion",ctx,76,want,48);assert(memcmp(a._ptk,want,48)==0);
+  // M2: version bits, MIC under CMAC, key data is own RSN then RSNXE.
+  const uint8_t*e=captured.data()+14;assert((((e[5]<<8)|e[6])&7)==ver&&((e[5]<<8)|e[6])&0x0100);
+  assert(((e[97]<<8)|e[98])==sizeof rsn+sizeof rsnxe&&!memcmp(e+99,rsn,sizeof rsn)&&!memcmp(e+99+sizeof rsn,rsnxe,sizeof rsnxe));
+  assert(eapol_mic_ok_for_version(ver,a._ptk,e,(uint32_t)captured.size()-14));
+  uint8_t kde[24]={0xdd,22,0x00,0x0f,0xac,0x01,1,0},wrapped[32];memset(kde+8,0x31,16);rtw88_aes_wrap(a._ptk+16,kde,24,wrapped);
+  // M3 with an HMAC-SHA1 MIC, or a damaged CMAC, must not install anything.
+  auto hm=build(0x13c8|ver,2,wrapped,32,true);int i0=installs;a.handleEAPOL(hm.data(),hm.size());assert(installs==i0&&a._state==4);
+  auto am3=build(0x13c8|ver,2,wrapped,32,false);am3[81]^=1;a.handleEAPOL(am3.data(),am3.size());assert(installs==i0&&a._state==4);
+  a._mgmtRxPnValid=true;a._mgmtRxPn=99;am3[81]^=1;a.handleEAPOL(am3.data(),am3.size());assert(!a._mgmtRxPnValid&&a._mgmtRxPn==0); // new PTK restarts the AP's PNs
+  a._mgmtRxPnValid=true;a._mgmtRxPn=99;a.handleEAPOL(am3.data(),am3.size());assert(a._mgmtRxPnValid&&a._mgmtRxPn==99); // M3 retry: same key, replay state kept
+  assert(installs==i0+2&&a._state==5&&a._ptkConf&&!memcmp(a._ptkConf->key,a._ptk+32,16)&&a._gtkConf&&a._gtkConf->keyidx==1&&a._gtkConf->key[0]==0x31);
+  // M4: version bits and Secure, CMAC verifies, no key data.
+  e=captured.data()+14;assert(((e[5]<<8)|e[6])==(0x0308|ver)&&e[97]==0&&e[98]==0&&eapol_mic_ok_for_version(ver,a._ptk,e,(uint32_t)captured.size()-14));
+  // Group rekey under the same keys.
+  uint8_t kde2[24]={0xdd,22,0x00,0x0f,0xac,0x01,2,0};memset(kde2+8,0x32,16);rtw88_aes_wrap(a._ptk+16,kde2,24,wrapped);
+  auto g=build(0x1380|ver,3,wrapped,32,false);
+  int s1=a.submissions;a.handleEAPOL(g.data(),g.size());assert(a.submissions==s1+1&&a._gtkConf->keyidx==2&&a._gtkConf->key[0]==0x32);
+  e=captured.data()+14;assert(((e[5]<<8)|e[6])==(0x0300|ver)&&eapol_mic_ok_for_version(ver,a._ptk,e,(uint32_t)captured.size()-14));
+ }
+ puts("PASS: HMAC/AES vectors; actual M1/M3 retries, replay/MIC rejection, PN preservation, submission failure, serialization and malformed inputs; EAPOL versions 0 and 3: KDF PTK, CMAC MICs, RSN+RSNXE in M2, wrong version/MIC refused, group rekey");
 }
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-handshake-') as td:
     p=Path(td);(p/'test.cpp').write_text(prefix+crypto+wire+main)
-    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+    subprocess.run(['xcrun','clang','-fsanitize=address,undefined','-g','-c',str(wpa3/'rtw88_crypto.c'),'-o',str(p/'crypto.o')],check=True)
+    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-g','-I',str(wpa3),str(p/'test.cpp'),str(p/'crypto.o'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)

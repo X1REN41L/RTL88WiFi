@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess, tempfile
 
 root=Path(__file__).resolve().parents[1]/'driver/RTL88WiFi'
+wpa3=root/'src/compat/wpa3'
 s=(root/'src/kext/RTW88IEEE80211.cpp').read_text()
 def fn(signature):
     start=s.index(signature);i=s.index('{',start)+1;depth=1
@@ -25,6 +26,7 @@ prefix=r'''
 #include <vector>
 #include <algorithm>
 #include <CommonCrypto/CommonSymmetricKeywrap.h>
+#include "rtw88_crypto.h"
 #define IOLog(...) ((void)0)
 #define WLAN_CIPHER_SUITE_CCMP 0x000fac04
 #define WLAN_CIPHER_SUITE_TKIP 0x000fac02
@@ -35,6 +37,7 @@ prefix=r'''
 #define kIONetworkLinkValid 2
 #define SET_KEY 1
 #define DISABLE_KEY 0
+#define RTW88_STATE_SCANNING 1
 #define RTW88_STATE_HANDSHAKING 4
 #define RTW88_STATE_CONNECTED 5
 using s8=int8_t;
@@ -57,23 +60,26 @@ struct Timer{void wakeAtTime(uint64_t){} void cancelTimeout(){}};
 struct Parent{void setLinkStatus(unsigned){}};
 class RTW88IEEE80211{
 public:
- HW*_hw;void*_vif=nullptr,*_sta=nullptr;Timer*_timer;Parent*_parent;
+ HW*_hw;void*_vif=nullptr;struct ieee80211_sta*_sta=nullptr;Timer*_timer;Parent*_parent;
  uint8_t _pmk[32]={1},_ptk[64]={},_gtk[32]={},_anonce[32]={},_snonce[32]={},_replayCtr[8]={},_installedM3ReplayCtr[8]={},_ccmpTxPn[6]={},_macAddr[6]={1,2,3,4,5,6};
- ieee80211_key_conf *_ptkConf=nullptr,*_gtkConf=nullptr;
+ ieee80211_key_conf *_ptkConf=nullptr,*_gtkConf=nullptr,*_retiredPtk=nullptr,*_retiredGtk=nullptr;bool _powered=true;
  bool _snonceValid=false,_m3KeysInstalled=false,_handshakePending=false,_associatedVisible=false,_eapolTxProtect=false;
  unsigned _state=RTW88_STATE_HANDSHAKING;
+ unsigned _scanReturnState=0;bool _manualScanAbort=false;uint8_t _keyVer=2,_ownRsnIE[32]={},_ownRsnLen=0,_ownRsnxe[3]={},_ownRsnxeLen=0;
+ bool _mgmtRxPnValid=false;uint64_t _mgmtRxPn=0;
  bool submitOK=true,lastProtect=false;int submissions=0,aggregationStarts=0;
  struct {uint8_t bssid[6]={7,8,9,10,11,12};uint32_t group_cipher=WLAN_CIPHER_SUITE_CCMP;} _targetBSS;
  bool installKey(ieee80211_key_conf**,bool,uint8_t,uint32_t,const uint8_t*,uint8_t);
+ void retireKey(ieee80211_key_conf**,ieee80211_key_conf**,struct ieee80211_sta*);
  void handleEAPOL(const uint8_t*,uint32_t);
  bool sendEAPOLKey(int,const uint8_t*,bool,bool,bool);
  bool txDataFrame(mbuf_t m){captured=*m;delete m;submissions++;lastProtect=_eapolTxProtect;return submitOK;}
  void startTxAggregation(){aggregationStarts++;}
- ~RTW88IEEE80211(){free(_ptkConf);free(_gtkConf);}
+ ~RTW88IEEE80211(){free(_ptkConf);free(_gtkConf);free(_retiredPtk);free(_retiredGtk);}
 };
 '''
 crypto=s[s.index('typedef struct {'):s.index('/* PCI device-ID')]
-wire='\n'.join(fn(x) for x in ('static void rtw88WriteSuite(', 'static uint16_t rtw88BuildSelectedRsnIe(', 'static const char *rtw88CipherName(', 'bool RTW88IEEE80211::installKey(', 'bool RTW88IEEE80211::sendEAPOLKey(', 'void RTW88IEEE80211::handleEAPOL('))
+wire='\n'.join(fn(x) for x in ('static void rtw88WriteSuite(', 'static uint16_t rtw88BuildSelectedRsnIe(', 'static const char *rtw88CipherName(', 'void RTW88IEEE80211::retireKey(', 'bool RTW88IEEE80211::installKey(', 'bool RTW88IEEE80211::sendEAPOLKey(', 'void RTW88IEEE80211::handleEAPOL('))
 main=r'''
 static std::vector<uint8_t> message(RTW88IEEE80211&c,uint16_t ki,uint8_t ctr,const uint8_t*nonce,const std::vector<uint8_t>&kd,bool sign){
  std::vector<uint8_t> p(99+kd.size(),0);uint16_t body=(uint16_t)(95+kd.size());
@@ -154,5 +160,6 @@ int main(){
 '''
 with tempfile.TemporaryDirectory(prefix='rtw88-groupkey-') as td:
     p=Path(td);(p/'test.cpp').write_text(prefix+crypto+wire+main)
-    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=undefined','-g',str(p/'test.cpp'),'-o',str(p/'test')],check=True)
+    subprocess.run(['xcrun','clang','-fsanitize=address,undefined','-fno-sanitize-recover=undefined','-g','-c',str(wpa3/'rtw88_crypto.c'),'-o',str(p/'crypto.o')],check=True)
+    subprocess.run(['xcrun','clang++','-std=c++17','-fsanitize=address,undefined','-fno-sanitize-recover=undefined','-g','-I',str(wpa3),str(p/'test.cpp'),str(p/'crypto.o'),'-o',str(p/'test')],check=True)
     subprocess.run([str(p/'test')],check=True)
